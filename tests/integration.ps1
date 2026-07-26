@@ -54,6 +54,16 @@ try {
         "single-agent setup remembers Claude"
     Assert-True ($null -eq $singleAgentConfig.PSObject.Properties["codex"]) `
         "single-agent setup omits unselected Codex configuration"
+    Assert-True (
+        (Split-Path -Leaf $singleAgentConfig.workingDirectory) -eq "probe"
+    ) "setup uses a dedicated probe working directory"
+    Assert-True (
+        @(Get-ChildItem -LiteralPath $singleAgentConfig.workingDirectory -Force).Count -eq 0
+    ) "the probe working directory is empty"
+    Assert-True (
+        $singleAgentConfig.claude.prompt -match
+        "Do not use tools.*Perform no action.*exactly: hi"
+    ) "setup stores an explicit no-action prompt"
     $continuousTask = Get-ScheduledTask -TaskName $taskName
     $continuousInfo = Get-ScheduledTaskInfo -TaskName $taskName
     Assert-True ($continuousTask.Triggers.Count -eq 1) `
@@ -68,6 +78,12 @@ try {
         "continuous setup reports the next run"
 
     if ($Live) {
+        $singleAgentConfig.notificationsEnabled = $false
+        [IO.File]::WriteAllText(
+            $configPath,
+            ($singleAgentConfig | ConvertTo-Json -Depth 6),
+            (New-Object Text.UTF8Encoding($false))
+        )
         $singleOutput = & powershell.exe `
             -NoLogo `
             -NoProfile `
@@ -86,6 +102,12 @@ try {
             "single-agent result contains one agent"
         Assert-True ($singleResult.results.claude.success) `
             "single-agent Claude check succeeds"
+        Assert-True ($singleResult.results.claude.usage.totalTokens -gt 0) `
+            "single-agent Claude check records token usage"
+        Assert-True ([bool]$singleResult.results.claude.model) `
+            "single-agent Claude check records its model"
+        Assert-True ($singleResult.results.claude.actionCount -eq 0) `
+            "single-agent Claude check records zero actions"
         Assert-True ($null -eq $singleResult.results.PSObject.Properties["codex"]) `
             "single-agent result omits Codex"
 
@@ -120,6 +142,20 @@ try {
         "Codex-only setup remembers Codex"
     Assert-True ($null -eq $codexOnlyConfig.PSObject.Properties["claude"]) `
         "Codex-only setup omits unselected Claude configuration"
+    Assert-True (
+        [bool]$codexOnlyConfig.codex.PSObject.Properties["instructionsPath"]
+    ) "Codex setup records the minimal instruction file path"
+    Assert-True (
+        Test-Path -LiteralPath $codexOnlyConfig.codex.instructionsPath
+    ) "Codex setup installs the minimal instruction file"
+    Assert-True (
+        (Get-Content -LiteralPath $codexOnlyConfig.codex.instructionsPath -Raw).Trim() -ceq
+        "Do not use tools or external context. Reply with exactly: hi"
+    ) "Codex instruction override contains only the probe behavior"
+    Assert-True (
+        (Split-Path -Parent $codexOnlyConfig.codex.instructionsPath) -eq
+        (Join-Path $installRoot "runtime")
+    ) "Codex instruction override is stored outside the empty probe directory"
 
     $dailySetup = & (Join-Path $repoRoot "setup.ps1") `
         -Agents Claude,Codex `
@@ -136,6 +172,9 @@ try {
         "daily mode stores only same-day five-hour slots"
     Assert-True ([bool]$installedConfig.notificationsEnabled) `
         "installed runs retain failure notifications"
+    Assert-True (
+        @(Get-ChildItem -LiteralPath $installedConfig.workingDirectory -Force).Count -eq 0
+    ) "combined setup leaves the dedicated probe directory empty"
     Assert-True ($dailySetup.Message -match "Next run:") `
         "setup reports the next run"
 
@@ -162,6 +201,27 @@ try {
     Assert-True (-not $tasks[0].Settings.StartWhenAvailable) `
         "missed daily slots are skipped"
 
+    $statusFixture = [ordered]@{
+        schemaVersion = 3
+        success = $true
+        results = [ordered]@{
+            claude = [ordered]@{
+                success = $true
+                actionCount = 0
+                usage = [ordered]@{ totalTokens = 101 }
+            }
+            codex = [ordered]@{
+                success = $true
+                actionCount = 0
+                usage = [ordered]@{ totalTokens = 202 }
+            }
+        }
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $installRoot "state\last-result.json"),
+        ($statusFixture | ConvertTo-Json -Depth 6),
+        (New-Object Text.UTF8Encoding($false))
+    )
     $status = & (Join-Path $repoRoot "status.ps1") `
         -TaskName $taskName `
         -InstallRoot $installRoot
@@ -170,6 +230,14 @@ try {
         "status reports the configured agents"
     Assert-True ($status.ScheduleMode -eq "Daily") `
         "status reports daily mode"
+    Assert-True ($status.ClaudeUsage.totalTokens -eq 101) `
+        "status exposes Claude token usage"
+    Assert-True ($status.CodexUsage.totalTokens -eq 202) `
+        "status exposes Codex token usage"
+    Assert-True ($status.ClaudeActionCount -eq 0) `
+        "status exposes Claude action count"
+    Assert-True ($status.CodexActionCount -eq 0) `
+        "status exposes Codex action count"
 
     if ($Live) {
         $startedAt = Get-Date
@@ -210,6 +278,17 @@ try {
             "combined live result contains both selected agents"
         Assert-True $lastResult.results.claude.success "Claude returns exact hi"
         Assert-True $lastResult.results.codex.success "Codex returns exact hi"
+        Assert-True ($lastResult.results.claude.usage.totalTokens -gt 0) `
+            "Claude records live token usage"
+        Assert-True ($lastResult.results.codex.usage.totalTokens -gt 0) `
+            "Codex records live token usage"
+        Assert-True ($lastResult.results.claude.actionCount -eq 0) `
+            "Claude live check records zero actions"
+        Assert-True ($lastResult.results.codex.actionCount -eq 0) `
+            "Codex live check records zero actions"
+        Assert-True (
+            @(Get-ChildItem -LiteralPath $installedConfig.workingDirectory -Force).Count -eq 0
+        ) "live checks do not write into the probe directory"
     }
 }
 finally {

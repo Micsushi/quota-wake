@@ -18,7 +18,7 @@ A hidden Windows task that makes minimal Claude Code or Codex calls every five h
 
 `-Agents` is required. Setup verifies only the selected agents, remembers the
 selection, installs under `%LOCALAPPDATA%\QuotaWake`, and registers one hidden
-`QuotaWake` task.
+`QuotaWake` task. Defaults are Claude Haiku and GPT-5.4 mini.
 
 ## Schedule modes
 
@@ -43,8 +43,17 @@ response, setup explains what to check and preserves the existing installation.
 ## Check status
 
 ```powershell
-.\status.ps1 | Format-List
+$status = .\status.ps1
+$status | Format-List
+$status.ClaudeUsage
+$status.CodexUsage
 ```
+
+Successful runs require exact `hi` output and token-usage metadata. Normalized
+usage, model, timing, and zero-action proof are saved locally; raw CLI payloads
+are not. Each probe runs from an empty directory with tools and project/user
+instructions disabled for that call only. Claude's system prompt and Codex's
+base instructions are replaced with probe-only instructions.
 
 ## Uninstall
 

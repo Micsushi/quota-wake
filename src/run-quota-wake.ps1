@@ -49,7 +49,9 @@ try {
             -Name $specification.Name `
             -FilePath $specification.FilePath `
             -ArgumentList $specification.ArgumentList `
-            -WorkingDirectory ([string]$config.workingDirectory)
+            -WorkingDirectory ([string]$config.workingDirectory) `
+            -OutputFormat $specification.OutputFormat `
+            -Model $specification.Model
     }
 
     foreach ($handle in $handles) {
@@ -97,7 +99,7 @@ foreach ($agent in $selectedAgents) {
 }
 $finishedAt = [DateTimeOffset]::Now
 $combinedResult = [ordered]@{
-    schemaVersion = 2
+    schemaVersion = 3
     agents        = $selectedAgents
     startedAt     = $startedAt.ToString("o")
     finishedAt    = $finishedAt.ToString("o")

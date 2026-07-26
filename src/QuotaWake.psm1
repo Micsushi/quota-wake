@@ -251,8 +251,10 @@ function Get-AgentProcessSpecifications {
     foreach ($agent in $Agents) {
         if ($agent -eq "Claude") {
             [pscustomobject]@{
-                Name = "Claude"
-                FilePath = [string]$Config.claude.path
+                Name         = "Claude"
+                FilePath     = [string]$Config.claude.path
+                Model        = [string]$Config.claude.model
+                OutputFormat = "ClaudeJson"
                 ArgumentList = @(
                     "-p",
                     [string]$Config.claude.prompt,
@@ -260,23 +262,75 @@ function Get-AgentProcessSpecifications {
                     [string]$Config.claude.model,
                     "--max-turns",
                     "1",
-                    "--no-session-persistence"
+                    "--no-session-persistence",
+                    "--no-chrome",
+                    "--tools=",
+                    "--disable-slash-commands",
+                    "--strict-mcp-config",
+                    "--setting-sources=",
+                    "--system-prompt",
+                    (
+                        "You are a connectivity probe. Do not use tools or " +
+                        "external context. Return only the requested literal text."
+                    ),
+                    "--output-format",
+                    "json"
                 )
             }
             continue
         }
 
         [pscustomobject]@{
-            Name = "Codex"
-            FilePath = [string]$Config.codex.path
+            Name         = "Codex"
+            FilePath     = [string]$Config.codex.path
+            Model        = [string]$Config.codex.model
+            OutputFormat = "CodexJson"
             ArgumentList = @(
                 "exec",
                 "--ephemeral",
                 "--skip-git-repo-check",
                 "--ignore-user-config",
                 "--ignore-rules",
+                "--disable",
+                "shell_tool",
+                "--disable",
+                "plugins",
+                "--disable",
+                "apps",
+                "--disable",
+                "browser_use",
+                "--disable",
+                "browser_use_external",
+                "--disable",
+                "browser_use_full_cdp_access",
+                "--disable",
+                "computer_use",
+                "--disable",
+                "goals",
+                "--disable",
+                "hooks",
+                "--disable",
+                "skill_search",
+                "--disable",
+                "multi_agent",
+                "--disable",
+                "image_generation",
+                "--disable",
+                "in_app_browser",
+                "--disable",
+                "tool_suggest",
+                "--disable",
+                "workspace_dependencies",
+                "-c",
+                "project_doc_max_bytes=0",
+                "-c",
+                (
+                    'model_instructions_file="{0}"' -f
+                    ([string]$Config.codex.instructionsPath).Replace('\', '/')
+                ),
                 "--color",
                 "never",
+                "--json",
                 "-m",
                 [string]$Config.codex.model,
                 "-s",
@@ -303,7 +357,12 @@ function Start-HiddenProcess {
         [string[]]$ArgumentList,
 
         [Parameter(Mandatory = $true)]
-        [string]$WorkingDirectory
+        [string]$WorkingDirectory,
+
+        [ValidateSet("Text", "ClaudeJson", "CodexJson")]
+        [string]$OutputFormat = "Text",
+
+        [string]$Model
     )
 
     $processInfo = New-Object Diagnostics.ProcessStartInfo
@@ -329,6 +388,8 @@ function Start-HiddenProcess {
         Process    = $process
         StdoutTask = $process.StandardOutput.ReadToEndAsync()
         StderrTask = $process.StandardError.ReadToEndAsync()
+        OutputFormat = $OutputFormat
+        Model        = $Model
     }
 }
 
@@ -373,12 +434,46 @@ function Complete-HiddenProcess {
                 error    = "$($Handle.Name) exited with code $($process.ExitCode)."
             }
         }
-        if (-not (Test-ExactHi -Output $stdout)) {
+        try {
+            if ($Handle.OutputFormat -eq "ClaudeJson") {
+                $probe = ConvertFrom-ClaudeProbeOutput -Output $stdout
+            }
+            elseif ($Handle.OutputFormat -eq "CodexJson") {
+                $probe = ConvertFrom-CodexProbeOutput `
+                    -Output $stdout `
+                    -Model $Handle.Model
+            }
+            else {
+                $probe = [pscustomobject]@{
+                    text = $stdout
+                    model = $Handle.Model
+                    usage = $null
+                    actionCount = $null
+                }
+            }
+        }
+        catch {
+            return [pscustomobject]@{
+                name     = $Handle.Name
+                success  = $false
+                exitCode = $process.ExitCode
+                error    = "$($Handle.Name) returned invalid structured output."
+            }
+        }
+        if (-not (Test-ExactHi -Output $probe.text)) {
             return [pscustomobject]@{
                 name     = $Handle.Name
                 success  = $false
                 exitCode = $process.ExitCode
                 error    = "$($Handle.Name) returned unexpected output."
+            }
+        }
+        if (-not $probe.usage -or $probe.usage.totalTokens -le 0) {
+            return [pscustomobject]@{
+                name     = $Handle.Name
+                success  = $false
+                exitCode = $process.ExitCode
+                error    = "$($Handle.Name) did not report token usage."
             }
         }
 
@@ -387,6 +482,9 @@ function Complete-HiddenProcess {
             success  = $true
             exitCode = $process.ExitCode
             output   = "hi"
+            model    = $probe.model
+            usage    = $probe.usage
+            actionCount = $probe.actionCount
             error    = $null
         }
     }
@@ -547,6 +645,133 @@ function Format-QuotaWakeNextRunMessage {
     return "Quota Wake is ready. Next run: $day at $($NextRunTime.ToString('h:mm tt'))."
 }
 
+function ConvertFrom-ClaudeProbeOutput {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Output
+    )
+
+    try {
+        $data = $Output | ConvertFrom-Json
+    }
+    catch {
+        throw "Claude returned invalid structured output."
+    }
+    if (
+        -not $data.PSObject.Properties["result"] -or
+        -not $data.PSObject.Properties["usage"]
+    ) {
+        throw "Claude structured output did not include result and usage data."
+    }
+    $permissionDenials = @()
+    if ($data.PSObject.Properties["permission_denials"]) {
+        $permissionDenials = @($data.permission_denials)
+    }
+    if ($permissionDenials.Count -gt 0) {
+        throw "Claude attempted an action during the no-action probe."
+    }
+
+    $modelProperty = $null
+    if ($data.PSObject.Properties["modelUsage"]) {
+        $modelProperty = $data.modelUsage.PSObject.Properties |
+            Select-Object -First 1
+    }
+    $inputTokens = [long]$data.usage.input_tokens
+    $cacheCreationTokens = [long]$data.usage.cache_creation_input_tokens
+    $cacheReadTokens = [long]$data.usage.cache_read_input_tokens
+    $outputTokens = [long]$data.usage.output_tokens
+    [pscustomobject]@{
+        text  = [string]$data.result
+        model = if ($modelProperty) { $modelProperty.Name } else { $null }
+        actionCount = 0
+        usage = [pscustomobject]@{
+            inputTokens              = $inputTokens
+            cacheCreationInputTokens = $cacheCreationTokens
+            cacheReadInputTokens     = $cacheReadTokens
+            outputTokens             = $outputTokens
+            totalTokens              = (
+                $inputTokens +
+                $cacheCreationTokens +
+                $cacheReadTokens +
+                $outputTokens
+            )
+            costUsd                  = if (
+                $data.PSObject.Properties["total_cost_usd"]
+            ) {
+                [double]$data.total_cost_usd
+            }
+            else {
+                $null
+            }
+        }
+    }
+}
+
+function ConvertFrom-CodexProbeOutput {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Output,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Model
+    )
+
+    $events = New-Object Collections.Generic.List[object]
+    foreach ($line in @($Output -split "\r?\n")) {
+        if (-not $line.Trim()) {
+            continue
+        }
+        try {
+            $events.Add(($line | ConvertFrom-Json))
+        }
+        catch {
+            throw "Codex returned invalid structured output."
+        }
+    }
+    $messageEvent = $events |
+        Where-Object {
+            $_.type -eq "item.completed" -and
+            $_.item.type -eq "agent_message"
+        } |
+        Select-Object -Last 1
+    $usageEvent = $events |
+        Where-Object { $_.type -eq "turn.completed" } |
+        Select-Object -Last 1
+    if (-not $messageEvent -or -not $usageEvent -or -not $usageEvent.usage) {
+        throw "Codex structured output did not include result and usage data."
+    }
+    $actionEvents = @($events | Where-Object {
+        (
+            $_.type -eq "item.started" -or
+            $_.type -eq "item.completed"
+        ) -and
+        $_.item -and
+        $_.item.type -notin @("agent_message", "reasoning")
+    })
+    if ($actionEvents.Count -gt 0) {
+        throw "Codex attempted an action during the no-action probe."
+    }
+
+    $inputTokens = [long]$usageEvent.usage.input_tokens
+    $outputTokens = [long]$usageEvent.usage.output_tokens
+    [pscustomobject]@{
+        text  = [string]$messageEvent.item.text
+        model = $Model
+        actionCount = 0
+        usage = [pscustomobject]@{
+            inputTokens          = $inputTokens
+            cachedInputTokens    = [long]$usageEvent.usage.cached_input_tokens
+            cacheWriteInputTokens = [long]$usageEvent.usage.cache_write_input_tokens
+            outputTokens         = $outputTokens
+            reasoningOutputTokens = [long]$usageEvent.usage.reasoning_output_tokens
+            totalTokens          = $inputTokens + $outputTokens
+            costUsd              = $null
+        }
+    }
+}
+
 function Show-QuotaWakeFailureNotification {
     [CmdletBinding()]
     param(
@@ -593,5 +818,7 @@ Export-ModuleMember -Function @(
     "Get-QuotaWakeDailyRunTimes",
     "Get-QuotaWakeNextDailyRun",
     "Format-QuotaWakeNextRunMessage",
+    "ConvertFrom-ClaudeProbeOutput",
+    "ConvertFrom-CodexProbeOutput",
     "Show-QuotaWakeFailureNotification"
 )

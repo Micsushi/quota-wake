@@ -88,8 +88,12 @@ foreach ($agent in $selectedAgents) {
 
 $runtimeDirectory = Join-Path $InstallRoot "runtime"
 $stateDirectory = Join-Path $InstallRoot "state"
+$probeDirectory = Join-Path $InstallRoot "probe"
 $installedModulePath = Join-Path $runtimeDirectory "QuotaWake.psm1"
 $installedWorkerPath = Join-Path $runtimeDirectory "run-quota-wake.ps1"
+$installedCodexInstructionsPath = Join-Path `
+    $runtimeDirectory `
+    "codex-instructions.txt"
 $configPath = Join-Path $runtimeDirectory "config.json"
 $workerPath = Join-Path $PSScriptRoot "src\run-quota-wake.ps1"
 $stagingRoot = Join-Path `
@@ -97,10 +101,20 @@ $stagingRoot = Join-Path `
     "QuotaWake-Setup-$([Guid]::NewGuid().ToString('N'))"
 $stagingRuntimeDirectory = Join-Path $stagingRoot "runtime"
 $stagingStateDirectory = Join-Path $stagingRoot "state"
+$stagingProbeDirectory = Join-Path $stagingRoot "probe"
 $stagingModulePath = Join-Path $stagingRuntimeDirectory "QuotaWake.psm1"
 $stagingWorkerPath = Join-Path $stagingRuntimeDirectory "run-quota-wake.ps1"
+$stagingCodexInstructionsPath = Join-Path `
+    $stagingRuntimeDirectory `
+    "codex-instructions.txt"
 $stagingConfigPath = Join-Path $stagingRuntimeDirectory "config.json"
-$prompt = "Reply with exactly: hi"
+$prompt = (
+    "Do not use tools, commands, files, network access, plugins, skills, " +
+    "or external context. Perform no action other than replying with exactly: hi"
+)
+$codexInstructions = (
+    "Do not use tools or external context. Reply with exactly: hi"
+)
 $config = [ordered]@{
     schemaVersion    = 3
     taskName         = $TaskName
@@ -109,7 +123,7 @@ $config = [ordered]@{
     intervalHours    = $IntervalHours
     timeoutSeconds   = $TimeoutSeconds
     notificationsEnabled = $false
-    workingDirectory = $stagingRoot
+    workingDirectory = $stagingProbeDirectory
     stateDirectory   = $stagingStateDirectory
 }
 if ($scheduleMode -eq "Daily") {
@@ -127,17 +141,24 @@ if ($selectedAgents -contains "Claude") {
 }
 if ($selectedAgents -contains "Codex") {
     $config["codex"] = [ordered]@{
-        path   = $resolvedPaths["Codex"]
-        model  = $CodexModel
-        prompt = $prompt
+        path             = $resolvedPaths["Codex"]
+        model            = $CodexModel
+        prompt           = $prompt
+        instructionsPath = $stagingCodexInstructionsPath
     }
 }
 
 try {
     [void](New-Item -ItemType Directory -Path $stagingRuntimeDirectory -Force)
     [void](New-Item -ItemType Directory -Path $stagingStateDirectory -Force)
+    [void](New-Item -ItemType Directory -Path $stagingProbeDirectory -Force)
     Copy-Item -LiteralPath $modulePath -Destination $stagingModulePath -Force
     Copy-Item -LiteralPath $workerPath -Destination $stagingWorkerPath -Force
+    if ($selectedAgents -contains "Codex") {
+        Write-AtomicUtf8File `
+            -Path $stagingCodexInstructionsPath `
+            -Content $codexInstructions
+    }
     Write-AtomicUtf8File `
         -Path $stagingConfigPath `
         -Content ($config | ConvertTo-Json -Depth 5)
@@ -187,10 +208,18 @@ try {
 
     [void](New-Item -ItemType Directory -Path $runtimeDirectory -Force)
     [void](New-Item -ItemType Directory -Path $stateDirectory -Force)
+    [void](New-Item -ItemType Directory -Path $probeDirectory -Force)
     Copy-Item -LiteralPath $stagingModulePath -Destination $installedModulePath -Force
     Copy-Item -LiteralPath $stagingWorkerPath -Destination $installedWorkerPath -Force
+    if ($selectedAgents -contains "Codex") {
+        Copy-Item `
+            -LiteralPath $stagingCodexInstructionsPath `
+            -Destination $installedCodexInstructionsPath `
+            -Force
+        $config["codex"]["instructionsPath"] = $installedCodexInstructionsPath
+    }
     $config["notificationsEnabled"] = $true
-    $config["workingDirectory"] = $InstallRoot
+    $config["workingDirectory"] = $probeDirectory
     $config["stateDirectory"] = $stateDirectory
     Write-AtomicUtf8File `
         -Path $configPath `

@@ -34,8 +34,26 @@ if (Test-Path -LiteralPath $configPath) {
 }
 $lastResultPath = Join-Path $InstallRoot "state\last-result.json"
 $lastResult = $null
+$claudeUsage = $null
+$codexUsage = $null
+$claudeModel = $null
+$codexModel = $null
+$claudeActionCount = $null
+$codexActionCount = $null
 if (Test-Path -LiteralPath $lastResultPath) {
     $lastResult = Get-Content -LiteralPath $lastResultPath -Raw | ConvertFrom-Json
+    if ($lastResult.results) {
+        if ($lastResult.results.PSObject.Properties["claude"]) {
+            $claudeUsage = $lastResult.results.claude.usage
+            $claudeModel = $lastResult.results.claude.model
+            $claudeActionCount = $lastResult.results.claude.actionCount
+        }
+        if ($lastResult.results.PSObject.Properties["codex"]) {
+            $codexUsage = $lastResult.results.codex.usage
+            $codexModel = $lastResult.results.codex.model
+            $codexActionCount = $lastResult.results.codex.actionCount
+        }
+    }
 }
 
 if (-not $task) {
@@ -46,6 +64,12 @@ if (-not $task) {
         ScheduleMode = $scheduleMode
         InstallRoot = $InstallRoot
         LastResult  = $lastResult
+        ClaudeModel = $claudeModel
+        ClaudeUsage = $claudeUsage
+        ClaudeActionCount = $claudeActionCount
+        CodexModel  = $codexModel
+        CodexUsage  = $codexUsage
+        CodexActionCount = $codexActionCount
     }
 }
 
@@ -61,4 +85,10 @@ $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName
     LastTaskResult = $taskInfo.LastTaskResult
     NextRunTime    = $taskInfo.NextRunTime
     LastResult     = $lastResult
+    ClaudeModel    = $claudeModel
+    ClaudeUsage    = $claudeUsage
+    ClaudeActionCount = $claudeActionCount
+    CodexModel     = $codexModel
+    CodexUsage     = $codexUsage
+    CodexActionCount = $codexActionCount
 }

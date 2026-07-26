@@ -67,6 +67,18 @@ $specifications = @(Get-AgentProcessSpecifications `
     -Config $testConfig)
 Assert-Equal 1 $specifications.Count "only selected agents get process specifications"
 Assert-Equal "Claude" $specifications[0].Name "Claude process specification is selected"
+Assert-Equal "ClaudeJson" $specifications[0].OutputFormat `
+    "Claude uses structured output"
+Assert-True ($specifications[0].ArgumentList -contains "--output-format") `
+    "Claude requests JSON output"
+Assert-True ($specifications[0].ArgumentList -contains "--disable-slash-commands") `
+    "Claude disables slash commands for this probe"
+Assert-True ($specifications[0].ArgumentList -contains "--strict-mcp-config") `
+    "Claude rejects inherited MCP servers for this probe"
+Assert-True ($specifications[0].ArgumentList -contains "--tools=") `
+    "Claude disables tools for this probe"
+Assert-True ($specifications[0].ArgumentList -contains "--setting-sources=") `
+    "Claude ignores setting sources for this probe"
 
 $codexConfig = [pscustomobject]@{
     workingDirectory = "C:\Quota Wake"
@@ -74,6 +86,7 @@ $codexConfig = [pscustomobject]@{
         path = "C:\Tools\codex.exe"
         model = "gpt-5.4-mini"
         prompt = "Reply with exactly: hi"
+        instructionsPath = "C:\Quota Wake\runtime\codex-instructions.txt"
     }
 }
 $codexSpecifications = @(Get-AgentProcessSpecifications `
@@ -82,6 +95,47 @@ $codexSpecifications = @(Get-AgentProcessSpecifications `
 Assert-Equal 1 $codexSpecifications.Count "Codex can be selected by itself"
 Assert-Equal "Codex" $codexSpecifications[0].Name `
     "Codex process specification is selected"
+Assert-Equal "CodexJson" $codexSpecifications[0].OutputFormat `
+    "Codex uses structured output"
+Assert-True ($codexSpecifications[0].ArgumentList -contains "--json") `
+    "Codex requests JSONL output"
+foreach ($feature in @(
+    "shell_tool",
+    "plugins",
+    "apps",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "computer_use",
+    "hooks",
+    "skill_search",
+    "multi_agent",
+    "image_generation",
+    "tool_suggest",
+    "workspace_dependencies"
+)) {
+    $featureIndex = [Array]::IndexOf(
+        [object[]]$codexSpecifications[0].ArgumentList,
+        $feature
+    )
+    Assert-True (
+        $featureIndex -gt 0 -and
+        $codexSpecifications[0].ArgumentList[$featureIndex - 1] -eq "--disable"
+    ) "Codex disables $feature for this probe"
+}
+Assert-True (
+    $codexSpecifications[0].ArgumentList -contains "project_doc_max_bytes=0"
+) "Codex disables project instruction loading for this probe"
+$instructionOverride = @(
+    $codexSpecifications[0].ArgumentList |
+        Where-Object { $_ -like "model_instructions_file=*" }
+)
+Assert-Equal 1 $instructionOverride.Count `
+    "Codex receives one base-instruction override"
+Assert-True (
+    $instructionOverride[0] -match
+    [regex]::Escape("C:/Quota Wake/runtime/codex-instructions.txt")
+) "Codex receives the configured minimal instruction file"
 
 $guidance = Get-AgentFailureGuidance `
     -Agent "Claude" `
@@ -143,6 +197,98 @@ $nextRunMessage = Format-QuotaWakeNextRunMessage `
     -Now ([datetime]"2026-07-26T20:01:00")
 Assert-True ($nextRunMessage -match "tomorrow at 5:00 AM") `
     "setup message describes a next-day run"
+
+$claudeFixture = @'
+{
+  "result": "hi",
+  "total_cost_usd": 0.0012,
+  "usage": {
+    "input_tokens": 10,
+    "cache_creation_input_tokens": 120,
+    "cache_read_input_tokens": 80,
+    "output_tokens": 4
+  },
+  "modelUsage": {
+    "claude-haiku-test": {
+      "inputTokens": 10,
+      "outputTokens": 4
+    }
+  },
+  "permission_denials": []
+}
+'@
+$claudeProbe = ConvertFrom-ClaudeProbeOutput -Output $claudeFixture
+Assert-Equal "hi" $claudeProbe.text "Claude structured result is extracted"
+Assert-Equal "claude-haiku-test" $claudeProbe.model "Claude actual model is recorded"
+Assert-Equal 0 $claudeProbe.actionCount "Claude reports no attempted actions"
+Assert-Equal 10 $claudeProbe.usage.inputTokens "Claude input tokens are recorded"
+Assert-Equal 120 $claudeProbe.usage.cacheCreationInputTokens `
+    "Claude cache creation tokens are recorded"
+Assert-Equal 80 $claudeProbe.usage.cacheReadInputTokens `
+    "Claude cache read tokens are recorded"
+Assert-Equal 4 $claudeProbe.usage.outputTokens "Claude output tokens are recorded"
+Assert-Equal 214 $claudeProbe.usage.totalTokens "Claude total tokens are normalized"
+Assert-Equal 0.0012 $claudeProbe.usage.costUsd "Claude reported cost is recorded"
+
+$codexFixture = @'
+{"type":"thread.started","thread_id":"redacted"}
+{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}
+{"type":"turn.completed","usage":{"input_tokens":140,"cached_input_tokens":40,"cache_write_input_tokens":0,"output_tokens":12,"reasoning_output_tokens":7}}
+'@
+$codexProbe = ConvertFrom-CodexProbeOutput `
+    -Output $codexFixture `
+    -Model "gpt-test-mini"
+Assert-Equal "hi" $codexProbe.text "Codex structured result is extracted"
+Assert-Equal "gpt-test-mini" $codexProbe.model "Codex requested model is recorded"
+Assert-Equal 0 $codexProbe.actionCount "Codex reports no attempted actions"
+Assert-Equal 140 $codexProbe.usage.inputTokens "Codex input tokens are recorded"
+Assert-Equal 40 $codexProbe.usage.cachedInputTokens `
+    "Codex cached input tokens are recorded"
+Assert-Equal 12 $codexProbe.usage.outputTokens "Codex output tokens are recorded"
+Assert-Equal 7 $codexProbe.usage.reasoningOutputTokens `
+    "Codex reasoning tokens are recorded"
+Assert-Equal 152 $codexProbe.usage.totalTokens "Codex total tokens are normalized"
+
+$missingUsageError = $null
+try {
+    [void](ConvertFrom-ClaudeProbeOutput -Output '{"result":"hi"}')
+}
+catch {
+    $missingUsageError = $_.Exception.Message
+}
+Assert-True ($missingUsageError -match "usage") `
+    "missing token usage invalidates a probe"
+
+$claudeActionError = $null
+try {
+    [void](ConvertFrom-ClaudeProbeOutput -Output @'
+{
+  "result": "hi",
+  "usage": {"input_tokens":1,"output_tokens":1},
+  "permission_denials": [{"tool_name":"Read"}]
+}
+'@)
+}
+catch {
+    $claudeActionError = $_.Exception.Message
+}
+Assert-True ($claudeActionError -match "action") `
+    "Claude permission denials invalidate a no-action probe"
+
+$codexActionError = $null
+try {
+    [void](ConvertFrom-CodexProbeOutput -Model "gpt-test-mini" -Output @'
+{"type":"thread.started","thread_id":"redacted"}
+{"type":"item.completed","item":{"type":"command_execution","command":"Get-ChildItem"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}
+{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
+'@)
+}
+catch {
+    $codexActionError = $_.Exception.Message
+}
+Assert-True ($codexActionError -match "action") `
+    "Codex tool events invalidate a no-action probe"
 
 $powershellPath = Resolve-CommandPath "powershell.exe"
 Assert-True ([IO.Path]::IsPathRooted($powershellPath)) "resolved executable is absolute"
