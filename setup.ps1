@@ -1,5 +1,23 @@
+<#
+.SYNOPSIS
+Installs or updates the Quota Wake scheduled task.
+
+.PARAMETER Agents
+One or more agents to verify and call: Claude, Codex, or both.
+
+.EXAMPLE
+.\setup.ps1 -Agents Claude
+
+.EXAMPLE
+.\setup.ps1 -Agents Codex
+
+.EXAMPLE
+.\setup.ps1 -Agents Claude,Codex
+#>
 [CmdletBinding()]
 param(
+    [string[]]$Agents,
+
     [ValidateRange(1, 168)]
     [int]$IntervalHours = 5,
 
@@ -32,63 +50,135 @@ if ($env:OS -ne "Windows_NT") {
 
 $modulePath = Join-Path $PSScriptRoot "src\QuotaWake.psm1"
 Import-Module $modulePath -Force -DisableNameChecking
+$selectedAgents = @(Resolve-AgentSelection -Agents $Agents)
 
 if (-not $InstallRoot) {
     $InstallRoot = Get-DefaultInstallRoot
 }
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot)
 
-$claudePath = Resolve-CommandPath "claude.exe"
-$codexPath = Resolve-CodexCommandPath
 $powershellPath = Resolve-CommandPath "powershell.exe"
+$resolvedPaths = @{}
+foreach ($agent in $selectedAgents) {
+    try {
+        if ($agent -eq "Claude") {
+            $resolvedPaths[$agent] = Resolve-CommandPath "claude.exe"
+        }
+        else {
+            $resolvedPaths[$agent] = Resolve-CodexCommandPath
+        }
+    }
+    catch {
+        throw Get-AgentFailureGuidance `
+            -Agent $agent `
+            -Problem $_.Exception.Message
+    }
+}
 
 $runtimeDirectory = Join-Path $InstallRoot "runtime"
 $stateDirectory = Join-Path $InstallRoot "state"
 $installedModulePath = Join-Path $runtimeDirectory "QuotaWake.psm1"
 $installedWorkerPath = Join-Path $runtimeDirectory "run-quota-wake.ps1"
 $configPath = Join-Path $runtimeDirectory "config.json"
-
-[void](New-Item -ItemType Directory -Path $runtimeDirectory -Force)
-[void](New-Item -ItemType Directory -Path $stateDirectory -Force)
-Copy-Item -LiteralPath $modulePath -Destination $installedModulePath -Force
-Copy-Item `
-    -LiteralPath (Join-Path $PSScriptRoot "src\run-quota-wake.ps1") `
-    -Destination $installedWorkerPath `
-    -Force
-
+$workerPath = Join-Path $PSScriptRoot "src\run-quota-wake.ps1"
+$stagingRoot = Join-Path `
+    ([IO.Path]::GetTempPath()) `
+    "QuotaWake-Setup-$([Guid]::NewGuid().ToString('N'))"
+$stagingRuntimeDirectory = Join-Path $stagingRoot "runtime"
+$stagingStateDirectory = Join-Path $stagingRoot "state"
+$stagingModulePath = Join-Path $stagingRuntimeDirectory "QuotaWake.psm1"
+$stagingWorkerPath = Join-Path $stagingRuntimeDirectory "run-quota-wake.ps1"
+$stagingConfigPath = Join-Path $stagingRuntimeDirectory "config.json"
 $prompt = "Reply with exactly: hi"
 $config = [ordered]@{
-    schemaVersion    = 1
+    schemaVersion    = 2
     taskName         = $TaskName
+    agents           = $selectedAgents
     intervalHours    = $IntervalHours
     timeoutSeconds   = $TimeoutSeconds
-    workingDirectory = $InstallRoot
-    stateDirectory   = $stateDirectory
-    claude            = [ordered]@{
-        path   = $claudePath
+    workingDirectory = $stagingRoot
+    stateDirectory   = $stagingStateDirectory
+}
+if ($selectedAgents -contains "Claude") {
+    $config["claude"] = [ordered]@{
+        path   = $resolvedPaths["Claude"]
         model  = $ClaudeModel
         prompt = $prompt
     }
-    codex             = [ordered]@{
-        path   = $codexPath
+}
+if ($selectedAgents -contains "Codex") {
+    $config["codex"] = [ordered]@{
+        path   = $resolvedPaths["Codex"]
         model  = $CodexModel
         prompt = $prompt
     }
 }
-Write-AtomicUtf8File `
-    -Path $configPath `
-    -Content ($config | ConvertTo-Json -Depth 5)
 
-if (-not $SkipLiveTest) {
-    $liveOutput = & $powershellPath `
-        -NoLogo `
-        -NoProfile `
-        -NonInteractive `
-        -ExecutionPolicy Bypass `
-        -File $installedWorkerPath `
-        -ConfigPath $configPath
-    if ($LASTEXITCODE -ne 0 -or -not (Test-ExactHi -Output ($liveOutput -join "`n"))) {
-        throw "Live Claude/Codex verification failed. Run status.ps1 for details."
+try {
+    [void](New-Item -ItemType Directory -Path $stagingRuntimeDirectory -Force)
+    [void](New-Item -ItemType Directory -Path $stagingStateDirectory -Force)
+    Copy-Item -LiteralPath $modulePath -Destination $stagingModulePath -Force
+    Copy-Item -LiteralPath $workerPath -Destination $stagingWorkerPath -Force
+    Write-AtomicUtf8File `
+        -Path $stagingConfigPath `
+        -Content ($config | ConvertTo-Json -Depth 5)
+
+    if (-not $SkipLiveTest) {
+        $liveOutput = & $powershellPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -ExecutionPolicy Bypass `
+            -File $stagingWorkerPath `
+            -ConfigPath $stagingConfigPath
+        if (
+            $LASTEXITCODE -ne 0 -or
+            -not (Test-ExactHi -Output ($liveOutput -join "`n"))
+        ) {
+            $lastResultPath = Join-Path $stagingStateDirectory "last-result.json"
+            $lastResult = $null
+            if (Test-Path -LiteralPath $lastResultPath) {
+                $lastResult = Get-Content `
+                    -LiteralPath $lastResultPath `
+                    -Raw | ConvertFrom-Json
+            }
+
+            $guidance = foreach ($agent in $selectedAgents) {
+                $problem = "verification did not complete successfully."
+                $resultProperty = $null
+                if ($lastResult -and $lastResult.results) {
+                    $resultProperty = $lastResult.results.PSObject.Properties[
+                        $agent.ToLowerInvariant()
+                    ]
+                    if ($resultProperty -and -not $resultProperty.Value.success) {
+                        $problem = $resultProperty.Value.error
+                    }
+                }
+                if (
+                    -not $lastResult -or
+                    -not $resultProperty -or
+                    -not $resultProperty.Value.success
+                ) {
+                    Get-AgentFailureGuidance -Agent $agent -Problem $problem
+                }
+            }
+            throw ($guidance -join [Environment]::NewLine)
+        }
+    }
+
+    [void](New-Item -ItemType Directory -Path $runtimeDirectory -Force)
+    [void](New-Item -ItemType Directory -Path $stateDirectory -Force)
+    Copy-Item -LiteralPath $stagingModulePath -Destination $installedModulePath -Force
+    Copy-Item -LiteralPath $stagingWorkerPath -Destination $installedWorkerPath -Force
+    $config["workingDirectory"] = $InstallRoot
+    $config["stateDirectory"] = $stateDirectory
+    Write-AtomicUtf8File `
+        -Path $configPath `
+        -Content ($config | ConvertTo-Json -Depth 5)
+}
+finally {
+    if (Test-Path -LiteralPath $stagingRoot) {
+        Remove-Item -LiteralPath $stagingRoot -Recurse -Force
     }
 }
 
@@ -136,7 +226,7 @@ $settings = New-ScheduledTaskSettingsSet `
 
 Register-ScheduledTask `
     -TaskName $TaskName `
-    -Description "Starts minimal Claude Code and Codex usage-window calls." `
+    -Description "Starts minimal $($selectedAgents -join ' and ') usage-window calls." `
     -Action $action `
     -Trigger $trigger `
     -Principal $principal `
@@ -150,6 +240,7 @@ $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName
     InstallRoot    = $InstallRoot
     NextRunTime    = $taskInfo.NextRunTime
     IntervalHours  = $IntervalHours
+    Agents         = $selectedAgents
     Hidden         = $true
     LiveTestPassed = -not $SkipLiveTest
 }

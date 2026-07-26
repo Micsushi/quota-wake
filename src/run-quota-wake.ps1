@@ -11,14 +11,20 @@ Import-Module (Join-Path $PSScriptRoot "QuotaWake.psm1") -Force -DisableNameChec
 $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
 foreach ($property in @(
     "schemaVersion",
+    "agents",
     "timeoutSeconds",
     "workingDirectory",
-    "stateDirectory",
-    "claude",
-    "codex"
+    "stateDirectory"
 )) {
     if ($null -eq $config.$property) {
         throw "Configuration is missing '$property'."
+    }
+}
+$selectedAgents = @(Resolve-AgentSelection -Agents @($config.agents))
+foreach ($agent in $selectedAgents) {
+    $propertyName = $agent.ToLowerInvariant()
+    if ($null -eq $config.PSObject.Properties[$propertyName]) {
+        throw "Configuration is missing '$propertyName'."
     }
 }
 
@@ -35,42 +41,16 @@ $handles = @()
 $results = @{}
 
 try {
-    $claudeArguments = @(
-        "-p",
-        [string]$config.claude.prompt,
-        "--model",
-        [string]$config.claude.model,
-        "--max-turns",
-        "1",
-        "--no-session-persistence"
-    )
-    $codexArguments = @(
-        "exec",
-        "--ephemeral",
-        "--skip-git-repo-check",
-        "--ignore-user-config",
-        "--ignore-rules",
-        "--color",
-        "never",
-        "-m",
-        [string]$config.codex.model,
-        "-s",
-        "read-only",
-        "-C",
-        [string]$config.workingDirectory,
-        [string]$config.codex.prompt
-    )
-
-    $handles += Start-HiddenProcess `
-        -Name "Claude" `
-        -FilePath ([string]$config.claude.path) `
-        -ArgumentList $claudeArguments `
-        -WorkingDirectory ([string]$config.workingDirectory)
-    $handles += Start-HiddenProcess `
-        -Name "Codex" `
-        -FilePath ([string]$config.codex.path) `
-        -ArgumentList $codexArguments `
-        -WorkingDirectory ([string]$config.workingDirectory)
+    $specifications = @(Get-AgentProcessSpecifications `
+        -Agents $selectedAgents `
+        -Config $config)
+    foreach ($specification in $specifications) {
+        $handles += Start-HiddenProcess `
+            -Name $specification.Name `
+            -FilePath $specification.FilePath `
+            -ArgumentList $specification.ArgumentList `
+            -WorkingDirectory ([string]$config.workingDirectory)
+    }
 
     foreach ($handle in $handles) {
         $results[$handle.Name] = Complete-HiddenProcess `
@@ -96,32 +76,34 @@ catch {
         }
     }
 
-    if (-not $results.ContainsKey("Claude")) {
-        $results["Claude"] = [pscustomobject]@{
-            name = "Claude"; success = $false; exitCode = $null
-            error = "Claude check did not start: $startupError"
-        }
-    }
-    if (-not $results.ContainsKey("Codex")) {
-        $results["Codex"] = [pscustomobject]@{
-            name = "Codex"; success = $false; exitCode = $null
-            error = "Codex check did not start: $startupError"
+    foreach ($agent in $selectedAgents) {
+        if (-not $results.ContainsKey($agent)) {
+            $results[$agent] = [pscustomobject]@{
+                name = $agent; success = $false; exitCode = $null
+                error = "$agent check did not start: $startupError"
+            }
         }
     }
 }
 
-$claudeResult = $results["Claude"]
-$codexResult = $results["Codex"]
-$success = [bool]($claudeResult.success -and $codexResult.success)
+$resultMap = [ordered]@{}
+$success = $true
+foreach ($agent in $selectedAgents) {
+    $agentResult = $results[$agent]
+    $resultMap[$agent.ToLowerInvariant()] = $agentResult
+    if (-not $agentResult.success) {
+        $success = $false
+    }
+}
 $finishedAt = [DateTimeOffset]::Now
 $combinedResult = [ordered]@{
-    schemaVersion = 1
+    schemaVersion = 2
+    agents        = $selectedAgents
     startedAt     = $startedAt.ToString("o")
     finishedAt    = $finishedAt.ToString("o")
     durationMs    = [int][Math]::Round(($finishedAt - $startedAt).TotalMilliseconds)
     success       = $success
-    claude        = $claudeResult
-    codex         = $codexResult
+    results       = $resultMap
 }
 $resultJson = $combinedResult | ConvertTo-Json -Depth 6
 Write-AtomicUtf8File -Path $lastResultPath -Content $resultJson
@@ -132,9 +114,9 @@ Write-AtomicUtf8File -Path $lastResultPath -Content $resultJson
 )
 
 if (-not $success) {
-    $failedNames = @()
-    if (-not $claudeResult.success) { $failedNames += "Claude" }
-    if (-not $codexResult.success) { $failedNames += "Codex" }
+    $failedNames = @($selectedAgents | Where-Object {
+        -not $results[$_].success
+    })
     Show-QuotaWakeFailureNotification -Message (
         "$($failedNames -join ' and ') check failed. Run status.ps1 for details."
     )

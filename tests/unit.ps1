@@ -29,6 +29,66 @@ Assert-True (Test-ExactHi "  hi`r`n") "surrounding whitespace is ignored"
 Assert-True (-not (Test-ExactHi "Hi")) "case changes fail"
 Assert-True (-not (Test-ExactHi "hi there")) "extra output fails"
 
+$agents = @(Resolve-AgentSelection @("claude", "Codex", "CLAUDE"))
+Assert-Equal 2 $agents.Count "agent selection removes duplicates"
+Assert-Equal "Claude" $agents[0] "Claude selection is canonical"
+Assert-Equal "Codex" $agents[1] "Codex selection is canonical"
+
+$missingAgentError = $null
+try {
+    [void](Resolve-AgentSelection @())
+}
+catch {
+    $missingAgentError = $_.Exception.Message
+}
+Assert-True ($missingAgentError -match "-Agents Claude") `
+    "missing selection includes setup examples"
+
+$invalidAgentError = $null
+try {
+    [void](Resolve-AgentSelection @("Gemini"))
+}
+catch {
+    $invalidAgentError = $_.Exception.Message
+}
+Assert-True ($invalidAgentError -match "Claude.*Codex") `
+    "invalid selection lists supported agents"
+
+$testConfig = [pscustomobject]@{
+    workingDirectory = "C:\Quota Wake"
+    claude = [pscustomobject]@{
+        path = "C:\Tools\claude.exe"
+        model = "haiku"
+        prompt = "Reply with exactly: hi"
+    }
+}
+$specifications = @(Get-AgentProcessSpecifications `
+    -Agents @("Claude") `
+    -Config $testConfig)
+Assert-Equal 1 $specifications.Count "only selected agents get process specifications"
+Assert-Equal "Claude" $specifications[0].Name "Claude process specification is selected"
+
+$codexConfig = [pscustomobject]@{
+    workingDirectory = "C:\Quota Wake"
+    codex = [pscustomobject]@{
+        path = "C:\Tools\codex.exe"
+        model = "gpt-5.4-mini"
+        prompt = "Reply with exactly: hi"
+    }
+}
+$codexSpecifications = @(Get-AgentProcessSpecifications `
+    -Agents @("Codex") `
+    -Config $codexConfig)
+Assert-Equal 1 $codexSpecifications.Count "Codex can be selected by itself"
+Assert-Equal "Codex" $codexSpecifications[0].Name `
+    "Codex process specification is selected"
+
+$guidance = Get-AgentFailureGuidance `
+    -Agent "Claude" `
+    -Problem "exited with code 1"
+Assert-True ($guidance -match "sign in") "failure guidance mentions authentication"
+Assert-True ($guidance -match "rerun") "failure guidance explains the next step"
+
 $powershellPath = Resolve-CommandPath "powershell.exe"
 Assert-True ([IO.Path]::IsPathRooted($powershellPath)) "resolved executable is absolute"
 Assert-True (Test-Path -LiteralPath $powershellPath) "resolved executable exists"

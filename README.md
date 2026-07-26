@@ -1,28 +1,33 @@
 # Quota Wake
 
-A hidden Windows task that makes minimal Claude Code and Codex calls every five hours.
+A hidden Windows task that makes minimal Claude Code or Codex calls every five hours.
 
 ## Requirements
 
 - Windows 10 or 11
 - Windows PowerShell 5.1
-- Signed-in Claude Code and Codex CLIs
+- At least one signed-in Claude Code or Codex CLI
 
 ## Install
 
 ```powershell
-.\setup.ps1
+.\setup.ps1 -Agents Claude
+.\setup.ps1 -Agents Codex
+.\setup.ps1 -Agents Claude,Codex
 ```
 
-Setup verifies both CLIs, installs the runtime under `%LOCALAPPDATA%\QuotaWake`,
-and registers one hidden `QuotaWake` task. Rerun it anytime to update or repair
-the installation.
+`-Agents` is required. Setup verifies only the selected agents, remembers the
+selection, installs under `%LOCALAPPDATA%\QuotaWake`, and registers one hidden
+`QuotaWake` task.
 
 Optional settings:
 
 ```powershell
-.\setup.ps1 -IntervalHours 5 -StartDelayMinutes 1 -TimeoutSeconds 90
+.\setup.ps1 -Agents Claude,Codex -IntervalHours 5 -TimeoutSeconds 90
 ```
+
+If a selected CLI is missing, signed out, times out, or returns an unexpected
+response, setup explains what to check and preserves the existing installation.
 
 ## Check status
 

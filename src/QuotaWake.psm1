@@ -165,6 +165,130 @@ function Test-ExactHi {
     return $Output.Trim() -ceq "hi"
 }
 
+function Get-AgentSetupHelp {
+    [CmdletBinding()]
+    param()
+
+    return @"
+Choose at least one agent:
+  .\setup.ps1 -Agents Claude
+  .\setup.ps1 -Agents Codex
+  .\setup.ps1 -Agents Claude,Codex
+Run 'Get-Help .\setup.ps1 -Examples' for help.
+"@.Trim()
+}
+
+function Resolve-AgentSelection {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [string[]]$Agents
+    )
+
+    $selection = New-Object Collections.Generic.List[string]
+    foreach ($value in @($Agents)) {
+        foreach ($part in @($value -split ",")) {
+            $name = $part.Trim()
+            if (-not $name) {
+                continue
+            }
+
+            $canonicalName = switch ($name.ToLowerInvariant()) {
+                "claude" { "Claude"; break }
+                "codex" { "Codex"; break }
+                default {
+                    throw "Unsupported agent '$name'. $(Get-AgentSetupHelp)"
+                }
+            }
+            if (-not $selection.Contains($canonicalName)) {
+                $selection.Add($canonicalName)
+            }
+        }
+    }
+
+    if ($selection.Count -eq 0) {
+        throw Get-AgentSetupHelp
+    }
+    return $selection.ToArray()
+}
+
+function Get-AgentFailureGuidance {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Claude", "Codex")]
+        [string]$Agent,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Problem
+    )
+
+    if ($Agent -eq "Claude") {
+        return (
+            "Claude is not ready: $Problem " +
+            "Confirm Claude Code is installed and claude.exe is in PATH, " +
+            "run 'claude' to sign in, then rerun setup with -Agents Claude."
+        )
+    }
+    return (
+        "Codex is not ready: $Problem " +
+        "Confirm Codex CLI is installed and codex.exe is available, " +
+        "run 'codex' to sign in, then rerun setup with -Agents Codex."
+    )
+}
+
+function Get-AgentProcessSpecifications {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Agents,
+
+        [Parameter(Mandatory = $true)]
+        $Config
+    )
+
+    foreach ($agent in $Agents) {
+        if ($agent -eq "Claude") {
+            [pscustomobject]@{
+                Name = "Claude"
+                FilePath = [string]$Config.claude.path
+                ArgumentList = @(
+                    "-p",
+                    [string]$Config.claude.prompt,
+                    "--model",
+                    [string]$Config.claude.model,
+                    "--max-turns",
+                    "1",
+                    "--no-session-persistence"
+                )
+            }
+            continue
+        }
+
+        [pscustomobject]@{
+            Name = "Codex"
+            FilePath = [string]$Config.codex.path
+            ArgumentList = @(
+                "exec",
+                "--ephemeral",
+                "--skip-git-repo-check",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--color",
+                "never",
+                "-m",
+                [string]$Config.codex.model,
+                "-s",
+                "read-only",
+                "-C",
+                [string]$Config.workingDirectory,
+                [string]$Config.codex.prompt
+            )
+        }
+    }
+}
+
 function Start-HiddenProcess {
     [CmdletBinding()]
     param(
@@ -336,6 +460,10 @@ Export-ModuleMember -Function @(
     "Resolve-CodexCommandPath",
     "Get-DefaultInstallRoot",
     "Test-ExactHi",
+    "Get-AgentSetupHelp",
+    "Resolve-AgentSelection",
+    "Get-AgentFailureGuidance",
+    "Get-AgentProcessSpecifications",
     "Start-HiddenProcess",
     "Complete-HiddenProcess",
     "Write-AtomicUtf8File",
