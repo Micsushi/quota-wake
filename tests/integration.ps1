@@ -23,7 +23,6 @@ try {
         & (Join-Path $repoRoot "setup.ps1") `
             -TaskName $taskName `
             -InstallRoot $installRoot `
-            -StartDelayMinutes 10 `
             -SkipLiveTest | Out-Null
     }
     catch {
@@ -38,21 +37,35 @@ try {
     Assert-True ($missingSelectionError -match "-Agents Claude") `
         "setup requires an explicit agent selection with examples"
 
-    & (Join-Path $repoRoot "setup.ps1") `
+    $continuousSetupStarted = Get-Date
+    $continuousSetup = & (Join-Path $repoRoot "setup.ps1") `
         -Agents Claude `
         -TaskName $taskName `
         -InstallRoot $installRoot `
-        -StartDelayMinutes 10 `
-        -SkipLiveTest | Out-Null
+        -SkipLiveTest
 
     $configPath = Join-Path $installRoot "runtime\config.json"
     $singleAgentConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    Assert-True ($singleAgentConfig.scheduleMode -eq "Continuous") `
+        "omitting StartTime selects continuous mode"
     Assert-True (@($singleAgentConfig.agents).Count -eq 1) `
         "single-agent setup stores one selection"
     Assert-True ($singleAgentConfig.agents[0] -eq "Claude") `
         "single-agent setup remembers Claude"
     Assert-True ($null -eq $singleAgentConfig.PSObject.Properties["codex"]) `
         "single-agent setup omits unselected Codex configuration"
+    $continuousTask = Get-ScheduledTask -TaskName $taskName
+    $continuousInfo = Get-ScheduledTaskInfo -TaskName $taskName
+    Assert-True ($continuousTask.Triggers.Count -eq 1) `
+        "continuous mode uses one repeating trigger"
+    Assert-True ($continuousTask.Triggers[0].Repetition.Interval -eq "PT5H") `
+        "continuous mode repeats every five hours across days"
+    Assert-True (
+        $continuousInfo.NextRunTime -gt $continuousSetupStarted -and
+        $continuousInfo.NextRunTime -le $continuousSetupStarted.AddMinutes(2)
+    ) "continuous mode starts within the next minute"
+    Assert-True ($continuousSetup.Message -match "Next run:") `
+        "continuous setup reports the next run"
 
     if ($Live) {
         $singleOutput = & powershell.exe `
@@ -84,7 +97,6 @@ try {
                 -ClaudeModel "quota-wake-invalid-model" `
                 -TaskName $taskName `
                 -InstallRoot $installRoot `
-                -StartDelayMinutes 10 `
                 -TimeoutSeconds 30 | Out-Null
         }
         catch {
@@ -100,7 +112,6 @@ try {
         -Agents Codex `
         -TaskName $taskName `
         -InstallRoot $installRoot `
-        -StartDelayMinutes 10 `
         -SkipLiveTest | Out-Null
     $codexOnlyConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
     Assert-True (@($codexOnlyConfig.agents).Count -eq 1) `
@@ -110,15 +121,33 @@ try {
     Assert-True ($null -eq $codexOnlyConfig.PSObject.Properties["claude"]) `
         "Codex-only setup omits unselected Claude configuration"
 
-    & (Join-Path $repoRoot "setup.ps1") `
+    $dailySetup = & (Join-Path $repoRoot "setup.ps1") `
         -Agents Claude,Codex `
+        -StartTime 5 `
         -TaskName $taskName `
         -InstallRoot $installRoot `
-        -StartDelayMinutes 10 `
-        -SkipLiveTest | Out-Null
+        -SkipLiveTest
+
+    $installedConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    Assert-True ($installedConfig.scheduleMode -eq "Daily") `
+        "providing StartTime selects daily mode"
+    Assert-True ((@($installedConfig.dailyRunTimes) -join ",") -eq `
+        "05:00,10:00,15:00,20:00") `
+        "daily mode stores only same-day five-hour slots"
+    Assert-True ([bool]$installedConfig.notificationsEnabled) `
+        "installed runs retain failure notifications"
+    Assert-True ($dailySetup.Message -match "Next run:") `
+        "setup reports the next run"
 
     $tasks = @(Get-ScheduledTask -TaskName $taskName -ErrorAction Stop)
     Assert-True ($tasks.Count -eq 1) "idempotent setup leaves one task"
+    Assert-True ($tasks[0].Triggers.Count -eq 4) `
+        "daily mode creates one trigger per same-day slot"
+    $triggerTimes = @($tasks[0].Triggers | ForEach-Object {
+        ([datetime]$_.StartBoundary).ToString("HH:mm")
+    })
+    Assert-True (($triggerTimes -join ",") -eq "05:00,10:00,15:00,20:00") `
+        "daily triggers reset at the configured start time"
 
     $action = $tasks[0].Actions[0]
     Assert-True ($action.Arguments -match "-NoProfile") "task skips profiles"
@@ -130,6 +159,8 @@ try {
         "task can start on battery"
     Assert-True (-not $tasks[0].Settings.StopIfGoingOnBatteries) `
         "task continues when switching to battery"
+    Assert-True (-not $tasks[0].Settings.StartWhenAvailable) `
+        "missed daily slots are skipped"
 
     $status = & (Join-Path $repoRoot "status.ps1") `
         -TaskName $taskName `
@@ -137,6 +168,8 @@ try {
     Assert-True ($status.Installed) "status sees installed task"
     Assert-True (@($status.Agents).Count -eq 2) `
         "status reports the configured agents"
+    Assert-True ($status.ScheduleMode -eq "Daily") `
+        "status reports daily mode"
 
     if ($Live) {
         $startedAt = Get-Date

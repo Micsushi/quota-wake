@@ -15,8 +15,15 @@ $InstallRoot = [IO.Path]::GetFullPath($InstallRoot)
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $configPath = Join-Path $InstallRoot "runtime\config.json"
 $agents = @()
+$scheduleMode = $null
 if (Test-Path -LiteralPath $configPath) {
     $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    if ($config.scheduleMode) {
+        $scheduleMode = $config.scheduleMode
+    }
+    else {
+        $scheduleMode = "Continuous"
+    }
     if ($config.agents) {
         $agents = @($config.agents)
     }
@@ -36,6 +43,7 @@ if (-not $task) {
         Installed   = $false
         TaskName    = $TaskName
         Agents      = $agents
+        ScheduleMode = $scheduleMode
         InstallRoot = $InstallRoot
         LastResult  = $lastResult
     }
@@ -46,6 +54,7 @@ $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName
     Installed      = $true
     TaskName       = $TaskName
     Agents         = $agents
+    ScheduleMode   = $scheduleMode
     State          = $task.State
     InstallRoot    = $InstallRoot
     LastRunTime    = $taskInfo.LastRunTime

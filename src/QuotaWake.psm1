@@ -426,6 +426,127 @@ function Write-AtomicUtf8File {
     }
 }
 
+function Test-FailureNotificationEnabled {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Config
+    )
+
+    $property = $Config.PSObject.Properties["notificationsEnabled"]
+    if (-not $property) {
+        return $true
+    }
+    return [bool]$property.Value
+}
+
+function ConvertTo-QuotaWakeTime {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Value
+    )
+
+    $normalized = $Value.Trim().ToLowerInvariant() -replace "\s", ""
+    if ($normalized -notmatch "^(?<hour>\d{1,2})(?::(?<minute>\d{2}))?(?<suffix>am|pm)?$") {
+        throw "Invalid start time '$Value'. Use a value such as 5, 5am, 17, or 17:30."
+    }
+
+    $hour = [int]$Matches["hour"]
+    $minute = 0
+    if ($Matches["minute"]) {
+        $minute = [int]$Matches["minute"]
+    }
+    $suffix = $Matches["suffix"]
+    if ($minute -gt 59) {
+        throw "Invalid start time '$Value'. Use a value such as 5, 5am, 17, or 17:30."
+    }
+
+    if ($suffix) {
+        if ($hour -lt 1 -or $hour -gt 12) {
+            throw "Invalid start time '$Value'. Use a value such as 5, 5am, 17, or 17:30."
+        }
+        if ($hour -eq 12) {
+            $hour = 0
+        }
+        if ($suffix -eq "pm") {
+            $hour += 12
+        }
+    }
+    elseif ($hour -gt 23) {
+        throw "Invalid start time '$Value'. Use a value such as 5, 5am, 17, or 17:30."
+    }
+
+    return New-TimeSpan -Hours $hour -Minutes $minute
+}
+
+function Get-QuotaWakeDailyRunTimes {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [TimeSpan]$StartTime,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(1, 168)]
+        [int]$IntervalHours
+    )
+
+    if ($StartTime -lt [TimeSpan]::Zero -or $StartTime -ge [TimeSpan]::FromDays(1)) {
+        throw "StartTime must be within one day."
+    }
+
+    $runTimes = New-Object Collections.Generic.List[TimeSpan]
+    $time = $StartTime
+    while ($time -lt [TimeSpan]::FromDays(1)) {
+        $runTimes.Add($time)
+        $time = $time.Add([TimeSpan]::FromHours($IntervalHours))
+    }
+    return $runTimes.ToArray()
+}
+
+function Get-QuotaWakeNextDailyRun {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [TimeSpan[]]$RunTimes,
+
+        [Parameter(Mandatory = $true)]
+        [DateTime]$Now
+    )
+
+    if ($RunTimes.Count -eq 0) {
+        throw "Daily mode requires at least one run time."
+    }
+    foreach ($runTime in $RunTimes | Sort-Object) {
+        $candidate = $Now.Date.Add($runTime)
+        if ($candidate -gt $Now) {
+            return $candidate
+        }
+    }
+    return $Now.Date.AddDays(1).Add(($RunTimes | Sort-Object | Select-Object -First 1))
+}
+
+function Format-QuotaWakeNextRunMessage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [DateTime]$NextRunTime,
+
+        [DateTime]$Now = (Get-Date)
+    )
+
+    if ($NextRunTime.Date -eq $Now.Date) {
+        $day = "today"
+    }
+    elseif ($NextRunTime.Date -eq $Now.Date.AddDays(1)) {
+        $day = "tomorrow"
+    }
+    else {
+        $day = $NextRunTime.ToString("dddd, MMMM d")
+    }
+    return "Quota Wake is ready. Next run: $day at $($NextRunTime.ToString('h:mm tt'))."
+}
+
 function Show-QuotaWakeFailureNotification {
     [CmdletBinding()]
     param(
@@ -467,5 +588,10 @@ Export-ModuleMember -Function @(
     "Start-HiddenProcess",
     "Complete-HiddenProcess",
     "Write-AtomicUtf8File",
+    "Test-FailureNotificationEnabled",
+    "ConvertTo-QuotaWakeTime",
+    "Get-QuotaWakeDailyRunTimes",
+    "Get-QuotaWakeNextDailyRun",
+    "Format-QuotaWakeNextRunMessage",
     "Show-QuotaWakeFailureNotification"
 )

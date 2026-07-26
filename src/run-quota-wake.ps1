@@ -117,9 +117,11 @@ if (-not $success) {
     $failedNames = @($selectedAgents | Where-Object {
         -not $results[$_].success
     })
-    Show-QuotaWakeFailureNotification -Message (
-        "$($failedNames -join ' and ') check failed. Run status.ps1 for details."
-    )
+    if (Test-FailureNotificationEnabled -Config $config) {
+        Show-QuotaWakeFailureNotification -Message (
+            "$($failedNames -join ' and ') check failed. Run status.ps1 for details."
+        )
+    }
     exit 1
 }
 

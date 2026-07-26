@@ -5,6 +5,9 @@ Installs or updates the Quota Wake scheduled task.
 .PARAMETER Agents
 One or more agents to verify and call: Claude, Codex, or both.
 
+.PARAMETER StartTime
+Optional local start time for daily mode. Omit it for continuous five-hour mode.
+
 .EXAMPLE
 .\setup.ps1 -Agents Claude
 
@@ -12,7 +15,7 @@ One or more agents to verify and call: Claude, Codex, or both.
 .\setup.ps1 -Agents Codex
 
 .EXAMPLE
-.\setup.ps1 -Agents Claude,Codex
+.\setup.ps1 -Agents Claude,Codex -StartTime 5
 #>
 [CmdletBinding()]
 param(
@@ -21,8 +24,7 @@ param(
     [ValidateRange(1, 168)]
     [int]$IntervalHours = 5,
 
-    [ValidateRange(0, 1440)]
-    [int]$StartDelayMinutes = 1,
+    [string]$StartTime,
 
     [ValidateRange(10, 600)]
     [int]$TimeoutSeconds = 90,
@@ -51,6 +53,15 @@ if ($env:OS -ne "Windows_NT") {
 $modulePath = Join-Path $PSScriptRoot "src\QuotaWake.psm1"
 Import-Module $modulePath -Force -DisableNameChecking
 $selectedAgents = @(Resolve-AgentSelection -Agents $Agents)
+$scheduleMode = "Continuous"
+$dailyRunTimes = @()
+if ($PSBoundParameters.ContainsKey("StartTime")) {
+    $scheduleMode = "Daily"
+    $parsedStartTime = ConvertTo-QuotaWakeTime -Value $StartTime
+    $dailyRunTimes = @(Get-QuotaWakeDailyRunTimes `
+        -StartTime $parsedStartTime `
+        -IntervalHours $IntervalHours)
+}
 
 if (-not $InstallRoot) {
     $InstallRoot = Get-DefaultInstallRoot
@@ -91,13 +102,21 @@ $stagingWorkerPath = Join-Path $stagingRuntimeDirectory "run-quota-wake.ps1"
 $stagingConfigPath = Join-Path $stagingRuntimeDirectory "config.json"
 $prompt = "Reply with exactly: hi"
 $config = [ordered]@{
-    schemaVersion    = 2
+    schemaVersion    = 3
     taskName         = $TaskName
     agents           = $selectedAgents
+    scheduleMode     = $scheduleMode
     intervalHours    = $IntervalHours
     timeoutSeconds   = $TimeoutSeconds
+    notificationsEnabled = $false
     workingDirectory = $stagingRoot
     stateDirectory   = $stagingStateDirectory
+}
+if ($scheduleMode -eq "Daily") {
+    $config["startTime"] = $parsedStartTime.ToString("hh\:mm")
+    $config["dailyRunTimes"] = @($dailyRunTimes | ForEach-Object {
+        $_.ToString("hh\:mm")
+    })
 }
 if ($selectedAgents -contains "Claude") {
     $config["claude"] = [ordered]@{
@@ -170,6 +189,7 @@ try {
     [void](New-Item -ItemType Directory -Path $stateDirectory -Force)
     Copy-Item -LiteralPath $stagingModulePath -Destination $installedModulePath -Force
     Copy-Item -LiteralPath $stagingWorkerPath -Destination $installedWorkerPath -Force
+    $config["notificationsEnabled"] = $true
     $config["workingDirectory"] = $InstallRoot
     $config["stateDirectory"] = $stateDirectory
     Write-AtomicUtf8File `
@@ -182,13 +202,20 @@ finally {
     }
 }
 
-$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-$startAt = (Get-Date).AddMinutes($StartDelayMinutes)
-if ($existingTask) {
-    $existingInfo = Get-ScheduledTaskInfo -TaskName $TaskName
-    if ($existingInfo.NextRunTime -gt (Get-Date)) {
-        $startAt = $existingInfo.NextRunTime
+$triggers = @()
+if ($scheduleMode -eq "Daily") {
+    foreach ($runTime in $dailyRunTimes) {
+        $triggers += New-ScheduledTaskTrigger `
+            -Daily `
+            -At ((Get-Date).Date.Add($runTime))
     }
+}
+else {
+    $triggers += New-ScheduledTaskTrigger `
+        -Once `
+        -At ((Get-Date).AddMinutes(1)) `
+        -RepetitionInterval (New-TimeSpan -Hours $IntervalHours) `
+        -RepetitionDuration (New-TimeSpan -Days 3650)
 }
 
 $taskArguments = @(
@@ -207,11 +234,6 @@ $taskArguments = @(
 $action = New-ScheduledTaskAction `
     -Execute $powershellPath `
     -Argument (Join-CommandLineArguments -ArgumentList $taskArguments)
-$trigger = New-ScheduledTaskTrigger `
-    -Once `
-    -At $startAt `
-    -RepetitionInterval (New-TimeSpan -Hours $IntervalHours) `
-    -RepetitionDuration (New-TimeSpan -Days 3650)
 $principal = New-ScheduledTaskPrincipal `
     -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
     -LogonType Interactive `
@@ -219,7 +241,6 @@ $principal = New-ScheduledTaskPrincipal `
 $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Seconds ($TimeoutSeconds + 30)) `
     -MultipleInstances IgnoreNew `
-    -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -WakeToRun
@@ -228,7 +249,7 @@ Register-ScheduledTask `
     -TaskName $TaskName `
     -Description "Starts minimal $($selectedAgents -join ' and ') usage-window calls." `
     -Action $action `
-    -Trigger $trigger `
+    -Trigger $triggers `
     -Principal $principal `
     -Settings $settings `
     -Force | Out-Null
@@ -237,10 +258,13 @@ $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName
 [pscustomobject]@{
     Installed      = $true
     TaskName       = $TaskName
+    ScheduleMode   = $scheduleMode
     InstallRoot    = $InstallRoot
     NextRunTime    = $taskInfo.NextRunTime
     IntervalHours  = $IntervalHours
     Agents         = $selectedAgents
     Hidden         = $true
     LiveTestPassed = -not $SkipLiveTest
+    Message        = Format-QuotaWakeNextRunMessage `
+        -NextRunTime $taskInfo.NextRunTime
 }

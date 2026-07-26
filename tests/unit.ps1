@@ -89,6 +89,61 @@ $guidance = Get-AgentFailureGuidance `
 Assert-True ($guidance -match "sign in") "failure guidance mentions authentication"
 Assert-True ($guidance -match "rerun") "failure guidance explains the next step"
 
+$notificationsDisabled = [pscustomobject]@{ notificationsEnabled = $false }
+$notificationsEnabled = [pscustomobject]@{ notificationsEnabled = $true }
+$legacyNotificationConfig = [pscustomobject]@{}
+Assert-True (-not (Test-FailureNotificationEnabled $notificationsDisabled)) `
+    "setup verification can suppress failure notifications"
+Assert-True (Test-FailureNotificationEnabled $notificationsEnabled) `
+    "installed runs can enable failure notifications"
+Assert-True (Test-FailureNotificationEnabled $legacyNotificationConfig) `
+    "legacy configurations retain failure notifications"
+
+$fiveAm = ConvertTo-QuotaWakeTime "5"
+Assert-Equal ([TimeSpan]::FromHours(5)) $fiveAm "bare hour means local 24-hour time"
+Assert-Equal ([TimeSpan]::FromHours(5)) `
+    (ConvertTo-QuotaWakeTime "5am") `
+    "AM input is accepted"
+Assert-Equal ([TimeSpan]::FromMinutes((17 * 60) + 30)) `
+    (ConvertTo-QuotaWakeTime "17:30") `
+    "24-hour time with minutes is accepted"
+Assert-Equal ([TimeSpan]::FromHours(18)) `
+    (ConvertTo-QuotaWakeTime "6 PM") `
+    "PM input is accepted"
+
+$invalidTimeError = $null
+try {
+    [void](ConvertTo-QuotaWakeTime "25:00")
+}
+catch {
+    $invalidTimeError = $_.Exception.Message
+}
+Assert-True ($invalidTimeError -match "5.*17:30") `
+    "invalid start time includes accepted examples"
+
+$dailyRunTimes = @(Get-QuotaWakeDailyRunTimes `
+    -StartTime $fiveAm `
+    -IntervalHours 5)
+Assert-Equal 4 $dailyRunTimes.Count "daily mode stops before crossing midnight"
+Assert-Equal "05:00,10:00,15:00,20:00" `
+    (($dailyRunTimes | ForEach-Object { $_.ToString("hh\:mm") }) -join ",") `
+    "daily mode resets at the start time each day"
+
+$morning = [datetime]"2026-07-26T08:00:00"
+$evening = [datetime]"2026-07-26T20:01:00"
+Assert-Equal ([datetime]"2026-07-26T10:00:00") `
+    (Get-QuotaWakeNextDailyRun -RunTimes $dailyRunTimes -Now $morning) `
+    "daily mode chooses the next remaining slot today"
+Assert-Equal ([datetime]"2026-07-27T05:00:00") `
+    (Get-QuotaWakeNextDailyRun -RunTimes $dailyRunTimes -Now $evening) `
+    "daily mode returns to its start time tomorrow"
+
+$nextRunMessage = Format-QuotaWakeNextRunMessage `
+    -NextRunTime ([datetime]"2026-07-27T05:00:00") `
+    -Now ([datetime]"2026-07-26T20:01:00")
+Assert-True ($nextRunMessage -match "tomorrow at 5:00 AM") `
+    "setup message describes a next-day run"
+
 $powershellPath = Resolve-CommandPath "powershell.exe"
 Assert-True ([IO.Path]::IsPathRooted($powershellPath)) "resolved executable is absolute"
 Assert-True (Test-Path -LiteralPath $powershellPath) "resolved executable exists"
