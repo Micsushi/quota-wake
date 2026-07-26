@@ -1,0 +1,7 @@
+.vscode/
+.idea/
+*.log
+*.tmp
+config.json
+last-result.json
+run-history.jsonl
