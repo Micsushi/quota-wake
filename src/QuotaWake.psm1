@@ -801,6 +801,578 @@ function Get-QuotaWakeDailyRunTimes {
     return $runTimes.ToArray()
 }
 
+function New-QuotaWakeSchedule {
+    [CmdletBinding(DefaultParameterSetName = "Continuous")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Continuous", "Daily")]
+        [string]$Mode,
+
+        [Parameter(Mandatory = $true)]
+        [DateTimeOffset]$EffectiveFrom,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TimeZoneId,
+
+        [Parameter(Mandatory = $true, ParameterSetName = "Continuous")]
+        [ValidateRange(1, 168)]
+        [int]$IntervalHours,
+
+        [Parameter(Mandatory = $true, ParameterSetName = "Daily")]
+        [string[]]$DailyRunTimes
+    )
+
+    if ($Mode -ne $PSCmdlet.ParameterSetName) {
+        throw "Schedule mode and schedule parameters do not match."
+    }
+    [void][TimeZoneInfo]::FindSystemTimeZoneById($TimeZoneId)
+
+    $normalizedTimes = @()
+    if ($Mode -eq "Daily") {
+        foreach ($value in $DailyRunTimes) {
+            $parsed = [TimeSpan]::Zero
+            if (-not [TimeSpan]::TryParse(
+                $value,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$parsed
+            )) {
+                throw "Daily run time '$value' is invalid."
+            }
+            if ($parsed -lt [TimeSpan]::Zero -or $parsed.TotalDays -ge 1) {
+                throw "Daily run time '$value' must be within one day."
+            }
+            $normalizedTimes += $parsed.ToString("hh\:mm\:ss")
+        }
+        $normalizedTimes = @($normalizedTimes | Sort-Object -Unique)
+        if ($normalizedTimes.Count -eq 0) {
+            throw "A daily schedule requires at least one run time."
+        }
+    }
+
+    $canonical = @(
+        $Mode
+        $EffectiveFrom.ToUniversalTime().ToString("o")
+        $TimeZoneId
+        if ($Mode -eq "Continuous") {
+            $IntervalHours.ToString(
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+        }
+        else {
+            $normalizedTimes -join ","
+        }
+    ) -join "|"
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))
+    }
+    finally {
+        $sha256.Dispose()
+    }
+    $id = "schedule-" + (($hash | ForEach-Object {
+        $_.ToString("x2")
+    }) -join "").Substring(0, 24)
+
+    $schedule = [ordered]@{
+        id            = $id
+        mode          = $Mode
+        effectiveFrom = $EffectiveFrom.ToString("o")
+        timeZoneId    = $TimeZoneId
+    }
+    if ($Mode -eq "Continuous") {
+        $schedule.intervalHours = $IntervalHours
+    }
+    else {
+        $schedule.dailyRunTimes = $normalizedTimes
+    }
+    return [pscustomobject]$schedule
+}
+
+function Get-QuotaWakeExpectedSlots {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Schedule,
+
+        [Parameter(Mandatory = $true)]
+        [DateTimeOffset]$Through
+    )
+
+    $effectiveFrom = [DateTimeOffset]::Parse(
+        [string]$Schedule.effectiveFrom,
+        [Globalization.CultureInfo]::InvariantCulture
+    )
+    if ($Through -lt $effectiveFrom) {
+        return
+    }
+
+    if ([string]$Schedule.mode -eq "Continuous") {
+        $interval = [TimeSpan]::FromHours([int]$Schedule.intervalHours)
+        $timeZone = [TimeZoneInfo]::FindSystemTimeZoneById(
+            [string]$Schedule.timeZoneId
+        )
+        for (
+            $slot = $effectiveFrom;
+            $slot -le $Through;
+            $slot = $slot.Add($interval)
+        ) {
+            Write-Output ([TimeZoneInfo]::ConvertTime($slot, $timeZone))
+        }
+        return
+    }
+    if ([string]$Schedule.mode -ne "Daily") {
+        throw "Unsupported schedule mode '$($Schedule.mode)'."
+    }
+
+    $timeZone = [TimeZoneInfo]::FindSystemTimeZoneById(
+        [string]$Schedule.timeZoneId
+    )
+    $firstLocal = [TimeZoneInfo]::ConvertTime($effectiveFrom, $timeZone)
+    $throughLocal = [TimeZoneInfo]::ConvertTime($Through, $timeZone)
+    for (
+        $date = $firstLocal.Date;
+        $date -le $throughLocal.Date;
+        $date = $date.AddDays(1)
+    ) {
+        foreach ($timeText in @($Schedule.dailyRunTimes)) {
+            $time = [TimeSpan]::ParseExact(
+                [string]$timeText,
+                "hh\:mm\:ss",
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+            $local = [DateTime]::SpecifyKind(
+                $date.Add($time),
+                [DateTimeKind]::Unspecified
+            )
+            if ($timeZone.IsInvalidTime($local)) {
+                continue
+            }
+            $offset = $timeZone.GetUtcOffset($local)
+            $slot = [DateTimeOffset]::new($local, $offset)
+            if ($slot -ge $effectiveFrom -and $slot -le $Through) {
+                Write-Output $slot
+            }
+        }
+    }
+}
+
+function Get-QuotaWakeSlotKey {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ScheduleId,
+
+        [Parameter(Mandatory = $true)]
+        [DateTimeOffset]$Slot
+    )
+
+    return (
+        "$ScheduleId|$($Slot.UtcDateTime.ToString('o'))"
+    )
+}
+
+function Get-QuotaWakeNextExpectedSlot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Schedule,
+
+        [Parameter(Mandatory = $true)]
+        [DateTimeOffset]$NotBefore,
+
+        [Parameter(Mandatory = $true)]
+        [DateTimeOffset]$Through
+    )
+
+    return @(Get-QuotaWakeExpectedSlots `
+        -Schedule $Schedule `
+        -Through $Through |
+        Where-Object { $_ -ge $NotBefore } |
+        Select-Object -First 1)[0]
+}
+
+function Get-QuotaWakeInvocation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Schedule,
+
+        [Parameter(Mandatory = $true)]
+        [DateTimeOffset]$InvocationTime,
+
+        [ValidateRange(0, 3600)]
+        [int]$GraceSeconds = 120
+    )
+
+    $slots = @(Get-QuotaWakeExpectedSlots `
+        -Schedule $Schedule `
+        -Through $InvocationTime)
+    if ($slots.Count -eq 0) {
+        return [pscustomobject]@{
+            IsLegitimate = $false
+            Slot          = $null
+            SlotKey       = $null
+        }
+    }
+    $slot = [DateTimeOffset]$slots[-1]
+    $isLegitimate = (
+        $InvocationTime -ge $slot -and
+        $InvocationTime -le $slot.AddSeconds($GraceSeconds)
+    )
+    return [pscustomobject]@{
+        IsLegitimate = $isLegitimate
+        Slot          = $slot
+        SlotKey       = Get-QuotaWakeSlotKey `
+            -ScheduleId ([string]$Schedule.id) `
+            -Slot $slot
+    }
+}
+
+function Get-QuotaWakeMissReason {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [DateTimeOffset]$Slot,
+
+        [AllowEmptyCollection()]
+        [object[]]$EvidenceIntervals = @()
+    )
+
+    foreach ($interval in @($EvidenceIntervals)) {
+        if (
+            [string]$interval.kind -in @(
+                "system_hibernating",
+                "system_off"
+            ) -and
+            $Slot -ge [DateTimeOffset]::Parse([string]$interval.unavailableFrom) -and
+            $Slot -lt [DateTimeOffset]::Parse([string]$interval.availableAgainAt)
+        ) {
+            return [pscustomobject]@{
+                code             = [string]$interval.kind
+                confidence       = "confirmed"
+                unavailableFrom  = [string]$interval.unavailableFrom
+                availableAgainAt = [string]$interval.availableAgainAt
+                availableFrom    = $null
+                availableUntil   = $null
+                evidence         = @($interval.evidence)
+            }
+        }
+    }
+    foreach ($interval in @($EvidenceIntervals)) {
+        if (
+            [string]$interval.kind -eq "available" -and
+            $Slot -ge [DateTimeOffset]::Parse([string]$interval.availableFrom) -and
+            $Slot -lt [DateTimeOffset]::Parse([string]$interval.availableUntil)
+        ) {
+            return [pscustomobject]@{
+                code             = "scheduler_did_not_start"
+                confidence       = "confirmed"
+                unavailableFrom  = $null
+                availableAgainAt = $null
+                availableFrom    = [string]$interval.availableFrom
+                availableUntil   = [string]$interval.availableUntil
+                evidence         = @($interval.evidence)
+            }
+        }
+    }
+    return [pscustomobject]@{
+        code             = "unknown"
+        confidence       = "unknown"
+        unavailableFrom  = $null
+        availableAgainAt = $null
+        availableFrom    = $null
+        availableUntil   = $null
+        evidence         = @()
+    }
+}
+
+function ConvertTo-QuotaWakeEvidenceIntervals {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Transitions,
+
+        [Parameter(Mandatory = $true)]
+        [DateTimeOffset]$Through
+    )
+
+    $availableFrom = $null
+    $availableEvidence = $null
+    $unavailable = $null
+    foreach ($transition in @($Transitions | Sort-Object {
+        [DateTimeOffset]::Parse([string]$_.time)
+    })) {
+        $time = [DateTimeOffset]::Parse([string]$transition.time)
+        if ($time -gt $Through) {
+            break
+        }
+        if ([string]$transition.kind -eq "available") {
+            if ($unavailable) {
+                [pscustomobject]@{
+                    kind             = [string]$unavailable.kind
+                    unavailableFrom  = (
+                        [DateTimeOffset]::Parse(
+                            [string]$unavailable.time
+                        ).ToString("o")
+                    )
+                    availableAgainAt = $time.ToString("o")
+                    evidence         = @(
+                        $unavailable.evidence
+                        $transition.evidence
+                    )
+                }
+                $unavailable = $null
+            }
+            $availableFrom = $time
+            $availableEvidence = $transition.evidence
+            continue
+        }
+
+        if ($availableFrom -and $time -gt $availableFrom) {
+            [pscustomobject]@{
+                kind           = "available"
+                availableFrom  = $availableFrom.ToString("o")
+                availableUntil = $time.ToString("o")
+                evidence       = @(
+                    $availableEvidence
+                    $transition.evidence
+                )
+            }
+        }
+        $availableFrom = $null
+        $availableEvidence = $null
+        if (-not $unavailable) {
+            $unavailable = $transition
+        }
+    }
+    if ($availableFrom -and $Through -gt $availableFrom) {
+        [pscustomobject]@{
+            kind           = "available"
+            availableFrom  = $availableFrom.ToString("o")
+            availableUntil = $Through.ToString("o")
+            evidence       = @($availableEvidence)
+        }
+    }
+}
+
+function ConvertFrom-QuotaWakePowerTroubleshooterXml {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Xml
+    )
+
+    $eventXml = [xml]$Xml
+    $eventData = @{}
+    foreach ($dataNode in @($eventXml.Event.EventData.Data)) {
+        $eventData[[string]$dataNode.Name] = [string]$dataNode.InnerText
+    }
+    $sleepTime = [DateTimeOffset]::Parse(
+        [string]$eventData["SleepTime"]
+    )
+    $wakeTime = [DateTimeOffset]::Parse(
+        [string]$eventData["WakeTime"]
+    )
+    if ($wakeTime -gt $sleepTime) {
+        [pscustomobject]@{
+            kind = "system_hibernating"
+            time = $sleepTime.ToString("o")
+            evidence = [pscustomobject]@{
+                provider = "Microsoft-Windows-Power-Troubleshooter"
+                eventId  = 1
+                time     = $sleepTime.ToString("o")
+            }
+        }
+    }
+    [pscustomobject]@{
+        kind = "available"
+        time = $wakeTime.ToString("o")
+        evidence = [pscustomobject]@{
+            provider = "Microsoft-Windows-Power-Troubleshooter"
+            eventId  = 1
+            time     = $wakeTime.ToString("o")
+        }
+    }
+}
+
+function Get-QuotaWakeWindowsEvidenceIntervals {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [DateTimeOffset]$From,
+
+        [Parameter(Mandatory = $true)]
+        [DateTimeOffset]$Through
+    )
+
+    $transitions = New-Object Collections.Generic.List[object]
+    $bootTime = $null
+    try {
+        $operatingSystem = Get-CimInstance `
+            Win32_OperatingSystem `
+            -ErrorAction Stop
+        $bootTime = [DateTimeOffset]$operatingSystem.LastBootUpTime
+    }
+    catch {
+    }
+
+    try {
+        $oldestEvent = Get-WinEvent `
+            -LogName "System" `
+            -Oldest `
+            -MaxEvents 1 `
+            -ErrorAction Stop
+        $coverageStart = [DateTimeOffset]$oldestEvent.TimeCreated
+        if ($bootTime -and $bootTime -gt $coverageStart) {
+            $coverageStart = $bootTime
+        }
+        if ($coverageStart -le $Through) {
+            $transitions.Add([pscustomobject]@{
+                kind = "available"
+                time = $coverageStart.ToString("o")
+                evidence = [pscustomobject]@{
+                    provider = "SystemEventLog"
+                    eventId  = 0
+                    time     = $coverageStart.ToString("o")
+                }
+            })
+        }
+        $eventErrors = @()
+        $events = @(Get-WinEvent -FilterHashtable @{
+            LogName   = "System"
+            StartTime = $From.LocalDateTime.AddDays(-1)
+            EndTime   = $Through.LocalDateTime.AddMinutes(1)
+            Id        = @(1, 12, 13, 42, 107, 6005, 6006)
+        } -ErrorAction SilentlyContinue -ErrorVariable +eventErrors)
+        $unexpectedEventErrors = @($eventErrors | Where-Object {
+            $_.FullyQualifiedErrorId -notlike "NoMatchingEventsFound,*"
+        })
+        if ($unexpectedEventErrors.Count -gt 0) {
+            throw "Windows System power events could not be read."
+        }
+        foreach ($event in $events) {
+            $provider = [string]$event.ProviderName
+            $kind = $null
+            if (
+                $event.Id -eq 1 -and
+                $provider -eq "Microsoft-Windows-Power-Troubleshooter"
+            ) {
+                try {
+                    foreach ($transition in @(
+                        ConvertFrom-QuotaWakePowerTroubleshooterXml `
+                            -Xml $event.ToXml()
+                    )) {
+                        $transitions.Add($transition)
+                    }
+                }
+                catch {
+                    throw "Windows power interval evidence could not be parsed."
+                }
+                continue
+            }
+            if (
+                $event.Id -eq 42 -and
+                $provider -eq "Microsoft-Windows-Kernel-Power"
+            ) {
+                $kind = "system_hibernating"
+            }
+            elseif (
+                ($event.Id -eq 13 -and
+                    $provider -eq "Microsoft-Windows-Kernel-General") -or
+                ($event.Id -eq 6006 -and $provider -eq "EventLog")
+            ) {
+                $kind = "system_off"
+            }
+            elseif (
+                ($event.Id -eq 12 -and
+                    $provider -eq "Microsoft-Windows-Kernel-General") -or
+                ($event.Id -eq 6005 -and $provider -eq "EventLog")
+            ) {
+                $kind = "available"
+            }
+            if (-not $kind) {
+                continue
+            }
+            $eventTime = [DateTimeOffset]$event.TimeCreated
+            $transitions.Add([pscustomobject]@{
+                kind = $kind
+                time = $eventTime.ToString("o")
+                evidence = [pscustomobject]@{
+                    provider = $provider
+                    eventId  = [int]$event.Id
+                    time     = $eventTime.ToString("o")
+                }
+            })
+        }
+    }
+    catch {
+        $transitions.Clear()
+    }
+
+    return @(ConvertTo-QuotaWakeEvidenceIntervals `
+        -Transitions $transitions.ToArray() `
+        -Through $Through)
+}
+
+function Group-QuotaWakeMissedSlots {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$ClassifiedSlots
+    )
+
+    $current = $null
+    $previousSequence = $null
+    foreach ($item in @($ClassifiedSlots)) {
+        $reason = $item.reason
+        $key = @(
+            [string]$reason.code
+            [string]$reason.confidence
+            [string]$reason.unavailableFrom
+            [string]$reason.availableAgainAt
+            [string]$reason.availableFrom
+            [string]$reason.availableUntil
+        ) -join "|"
+        $sequence = if ($item.PSObject.Properties["sequence"]) {
+            [long]$item.sequence
+        }
+        elseif ($null -eq $previousSequence) {
+            0
+        }
+        else {
+            $previousSequence + 1
+        }
+        if (
+            $null -eq $current -or
+            $current.Key -cne $key -or
+            ($null -ne $previousSequence -and
+                $sequence -ne ($previousSequence + 1))
+        ) {
+            if ($null -ne $current) {
+                Write-Output ([pscustomobject]@{
+                    Slots  = $current.Slots.ToArray()
+                    Reason = $current.Reason
+                })
+            }
+            $current = [pscustomobject]@{
+                Key    = $key
+                Slots  = New-Object Collections.Generic.List[DateTimeOffset]
+                Reason = $reason
+            }
+        }
+        $current.Slots.Add([DateTimeOffset]$item.slot)
+        $previousSequence = $sequence
+    }
+    if ($null -ne $current) {
+        Write-Output ([pscustomobject]@{
+            Slots  = $current.Slots.ToArray()
+            Reason = $current.Reason
+        })
+    }
+}
+
 function Format-QuotaWakeNextRunMessage {
     [CmdletBinding()]
     param(
@@ -1033,6 +1605,16 @@ Export-ModuleMember -Function @(
     "Test-FailureNotificationEnabled",
     "ConvertTo-QuotaWakeTime",
     "Get-QuotaWakeDailyRunTimes",
+    "New-QuotaWakeSchedule",
+    "Get-QuotaWakeExpectedSlots",
+    "Get-QuotaWakeNextExpectedSlot",
+    "Get-QuotaWakeSlotKey",
+    "Get-QuotaWakeInvocation",
+    "Get-QuotaWakeMissReason",
+    "ConvertTo-QuotaWakeEvidenceIntervals",
+    "ConvertFrom-QuotaWakePowerTroubleshooterXml",
+    "Get-QuotaWakeWindowsEvidenceIntervals",
+    "Group-QuotaWakeMissedSlots",
     "Format-QuotaWakeNextRunMessage",
     "ConvertFrom-ClaudeProbeOutput",
     "ConvertFrom-CodexProbeOutput",

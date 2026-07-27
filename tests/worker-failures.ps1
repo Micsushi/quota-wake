@@ -40,6 +40,51 @@ try {
     Assert-True ($lastResult.results.worker.error -match "configuration") `
         "preflight result explains the configuration failure"
 
+    $invalidV4Root = Join-Path $testRoot "invalid-v4"
+    $invalidV4Runtime = Join-Path $invalidV4Root "runtime"
+    $invalidV4State = Join-Path $invalidV4Root "state"
+    $invalidV4Probe = Join-Path $invalidV4Root "probe"
+    [void](New-Item -ItemType Directory -Path $invalidV4Runtime -Force)
+    $invalidV4ConfigPath = Join-Path $invalidV4Runtime "config.json"
+    [IO.File]::WriteAllText(
+        $invalidV4ConfigPath,
+        ([ordered]@{
+            schemaVersion = 4
+            agents = @("Claude")
+            graceSeconds = 120
+            timeoutSeconds = 10
+            notificationsEnabled = $false
+            workingDirectory = $invalidV4Probe
+            stateDirectory = $invalidV4State
+            claude = [ordered]@{
+                path = Join-Path $invalidV4Root "missing-claude.exe"
+                model = "haiku"
+                prompt = "Reply with exactly: hi"
+            }
+        } | ConvertTo-Json -Depth 5)
+    )
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $output = & powershell.exe `
+        -NoLogo `
+        -NoProfile `
+        -NonInteractive `
+        -ExecutionPolicy Bypass `
+        -File (Join-Path $repoRoot "src\run-quota-wake.ps1") `
+        -ConfigPath $invalidV4ConfigPath 2>&1
+    $invalidV4ExitCode = $LASTEXITCODE
+    $ErrorActionPreference = $previousErrorActionPreference
+    Assert-True ($invalidV4ExitCode -ne 0) `
+        "invalid version-four configuration exits nonzero"
+    Assert-True (
+        Test-Path `
+            -LiteralPath (Join-Path $invalidV4State "last-result.json") `
+            -PathType Leaf
+    ) "invalid version-four configuration writes last result"
+    Assert-True (-not (Test-Path `
+        -LiteralPath (Join-Path $invalidV4State "run-history.jsonl"))) `
+        "invalid version-four configuration does not pollute slot history"
+
     $persistenceRoot = Join-Path $testRoot "persistence-case"
     $persistenceRuntime = Join-Path $persistenceRoot "runtime"
     $persistenceState = Join-Path $persistenceRoot "state"

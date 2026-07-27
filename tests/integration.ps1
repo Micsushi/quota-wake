@@ -13,6 +13,10 @@ function Assert-True {
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+Import-Module `
+    (Join-Path $repoRoot "src\QuotaWake.psm1") `
+    -Force `
+    -DisableNameChecking
 $suffix = [Guid]::NewGuid().ToString("N").Substring(0, 8)
 $taskName = "QuotaWake-Test-$suffix"
 $installRoot = Join-Path $env:TEMP "Quota Wake Test $suffix"
@@ -72,6 +76,17 @@ try {
     $singleAgentConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
     Assert-True ($singleAgentConfig.scheduleMode -eq "Continuous") `
         "omitting StartTime selects continuous mode"
+    Assert-True ($singleAgentConfig.schemaVersion -eq 4) `
+        "setup writes schema version four"
+    Assert-True ([bool]$singleAgentConfig.schedule.id) `
+        "setup stores a schedule generation identifier"
+    Assert-True ($singleAgentConfig.schedule.mode -eq "Continuous") `
+        "continuous mode is stored in the schedule"
+    Assert-True ($singleAgentConfig.schedule.intervalHours -eq 5) `
+        "continuous interval is stored in the schedule"
+    Assert-True ([bool]$singleAgentConfig.schedule.effectiveFrom) `
+        "schedule stores its first effective slot"
+    $continuousScheduleId = $singleAgentConfig.schedule.id
     Assert-True (@($singleAgentConfig.agents).Count -eq 1) `
         "single-agent setup stores one selection"
     Assert-True ($singleAgentConfig.agents[0] -eq "Claude") `
@@ -95,17 +110,34 @@ try {
     Assert-True ($continuousTask.Triggers[0].Repetition.Interval -eq "PT5H") `
         "continuous mode repeats every five hours across days"
     Assert-True (
-        $continuousInfo.NextRunTime -gt $continuousSetupStarted -and
+        $continuousInfo.NextRunTime -ge $continuousSetupStarted.AddSeconds(30) -and
         $continuousInfo.NextRunTime -le $continuousSetupStarted.AddMinutes(2)
-    ) "continuous mode starts within the next minute"
+    ) "continuous mode leaves a safe registration lead"
+    Assert-True (
+        [Math]::Abs((
+            $continuousInfo.NextRunTime -
+            ([DateTimeOffset]$singleAgentConfig.schedule.effectiveFrom).LocalDateTime
+        ).TotalSeconds) -lt 1
+    ) "continuous trigger and persisted schedule share one first slot"
+    Assert-True (-not $continuousTask.Settings.AllowDemandStart) `
+        "production tasks reject manual demand starts"
+    Assert-True (-not $continuousTask.Settings.StartWhenAvailable) `
+        "production tasks do not replay missed starts"
     Assert-True ($continuousSetup.Message -match "Next run:") `
         "continuous setup reports the next run"
 
     if ($Live) {
+        $singleAgentDeploymentSchedule = $singleAgentConfig.schedule
+        $singleAgentConfig.schedule = New-QuotaWakeSchedule `
+            -Mode Continuous `
+            -EffectiveFrom ([DateTimeOffset]::Now.AddSeconds(-1)) `
+            -TimeZoneId ([TimeZoneInfo]::Local.Id) `
+            -IntervalHours 1
+        $singleVerificationScheduleId = $singleAgentConfig.schedule.id
         $singleAgentConfig.notificationsEnabled = $false
         [IO.File]::WriteAllText(
             $configPath,
-            ($singleAgentConfig | ConvertTo-Json -Depth 6),
+            ($singleAgentConfig | ConvertTo-Json -Depth 8),
             (New-Object Text.UTF8Encoding($false))
         )
         $singleOutput = & powershell.exe `
@@ -124,6 +156,9 @@ try {
             -Raw | ConvertFrom-Json
         Assert-True (@($singleResult.agents).Count -eq 1) `
             "single-agent result contains one agent"
+        Assert-True (
+            $singleResult.scheduleId -eq $singleVerificationScheduleId
+        ) "single-agent result was freshly written for the verification slot"
         Assert-True ($singleResult.results.claude.success) `
             "single-agent Claude check succeeds"
         Assert-True ($singleResult.results.claude.usage.totalTokens -gt 0) `
@@ -135,6 +170,12 @@ try {
         Assert-True ($null -eq $singleResult.results.PSObject.Properties["codex"]) `
             "single-agent result omits Codex"
 
+        $singleAgentConfig.schedule = $singleAgentDeploymentSchedule
+        [IO.File]::WriteAllText(
+            $configPath,
+            ($singleAgentConfig | ConvertTo-Json -Depth 8),
+            (New-Object Text.UTF8Encoding($false))
+        )
         $workingConfigHash = (Get-FileHash -LiteralPath $configPath).Hash
         $failedSetupMessage = $null
         try {
@@ -154,12 +195,43 @@ try {
             "failed verification preserves the working configuration"
     }
 
+    $boundaryConfig = Get-Content -LiteralPath $configPath -Raw |
+        ConvertFrom-Json
+    $boundaryConfig.schedule = New-QuotaWakeSchedule `
+        -Mode Continuous `
+        -EffectiveFrom ([DateTimeOffset]::Now.AddSeconds(5)) `
+        -TimeZoneId ([TimeZoneInfo]::Local.Id) `
+        -IntervalHours 5
+    $imminentScheduleId = $boundaryConfig.schedule.id
+    [IO.File]::WriteAllText(
+        $configPath,
+        ($boundaryConfig | ConvertTo-Json -Depth 8),
+        (New-Object Text.UTF8Encoding($false))
+    )
+    $boundarySetupStarted = [DateTimeOffset]::Now
+    & (Join-Path $repoRoot "setup.ps1") `
+        -Agents Claude `
+        -TaskName $taskName `
+        -InstallRoot $installRoot `
+        -SkipLiveTest | Out-Null
+    $boundarySafeConfig = Get-Content -LiteralPath $configPath -Raw |
+        ConvertFrom-Json
+    Assert-True ($boundarySafeConfig.schedule.id -ne $imminentScheduleId) `
+        "rerun near an existing boundary starts a safe schedule generation"
+    Assert-True (
+        [DateTimeOffset]$boundarySafeConfig.schedule.effectiveFrom -ge
+        $boundarySetupStarted.AddSeconds(30)
+    ) "rerun cannot persist a first slot before registration can finish"
+    $continuousScheduleId = $boundarySafeConfig.schedule.id
+
     & (Join-Path $repoRoot "setup.ps1") `
         -Agents Codex `
         -TaskName $taskName `
         -InstallRoot $installRoot `
         -SkipLiveTest | Out-Null
     $codexOnlyConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    Assert-True ($codexOnlyConfig.schedule.id -eq $continuousScheduleId) `
+        "unchanged setup reuses the schedule generation"
     Assert-True (@($codexOnlyConfig.agents).Count -eq 1) `
         "Codex-only setup stores one selection"
     Assert-True ($codexOnlyConfig.agents[0] -eq "Codex") `
@@ -186,11 +258,23 @@ try {
         -StartTime 5 `
         -TaskName $taskName `
         -InstallRoot $installRoot `
+        -AllowTestDemandStart `
         -SkipLiveTest
 
     $installedConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
     Assert-True ($installedConfig.scheduleMode -eq "Daily") `
         "providing StartTime selects daily mode"
+    Assert-True ($installedConfig.schedule.id -ne $continuousScheduleId) `
+        "changing the schedule creates a new generation"
+    Assert-True (@($installedConfig.schedule.dailyRunTimes).Count -eq 4) `
+        "daily schedule stores every expected run time"
+    $dailyTaskInfo = Get-ScheduledTaskInfo -TaskName $taskName
+    Assert-True (
+        [Math]::Abs((
+            $dailyTaskInfo.NextRunTime -
+            ([DateTimeOffset]$installedConfig.schedule.effectiveFrom).LocalDateTime
+        ).TotalSeconds) -lt 1
+    ) "daily trigger and persisted schedule share one first slot"
     Assert-True ([bool]$installedConfig.notificationsEnabled) `
         "installed runs retain failure notifications"
     Assert-True (
@@ -221,9 +305,16 @@ try {
         "task continues when switching to battery"
     Assert-True (-not $tasks[0].Settings.StartWhenAvailable) `
         "missed daily slots are skipped"
+    Assert-True ($tasks[0].Settings.AllowDemandStart) `
+        "temporary integration tasks can opt into demand starts"
 
     $statusFixture = [ordered]@{
-        schemaVersion = 3
+        schemaVersion = 4
+        recordType = "executed"
+        scheduleId = $installedConfig.schedule.id
+        slotKey = "$($installedConfig.schedule.id)|2026-07-26T11:00:00.0000000Z"
+        scheduledFor = "2026-07-26T05:00:00-06:00"
+        outcome = "succeeded"
         success = $true
         results = [ordered]@{
             claude = [ordered]@{
@@ -241,6 +332,47 @@ try {
     [IO.File]::WriteAllText(
         (Join-Path $installRoot "state\last-result.json"),
         ($statusFixture | ConvertTo-Json -Depth 6),
+        (New-Object Text.UTF8Encoding($false))
+    )
+    $statusHistory = @(
+        $statusFixture
+        [ordered]@{
+            schemaVersion = 4
+            recordType = "missed"
+            scheduleId = $installedConfig.schedule.id
+            scheduledSlots = @(
+                "2026-07-26T10:00:00-06:00"
+                "2026-07-26T15:00:00-06:00"
+                "2026-07-26T20:00:00-06:00"
+            )
+            count = 3
+            firstScheduledFor = "2026-07-26T10:00:00-06:00"
+            lastScheduledFor = "2026-07-26T20:00:00-06:00"
+            observedAt = "2026-07-27T05:00:00-06:00"
+            reason = [ordered]@{
+                code = "system_hibernating"
+                confidence = "confirmed"
+            }
+        }
+        [ordered]@{
+            schemaVersion = 4
+            recordType = "executed"
+            scheduleId = $installedConfig.schedule.id
+            slotKey = "$($installedConfig.schedule.id)|2026-07-27T11:00:00.0000000Z"
+            scheduledFor = "2026-07-27T05:00:00-06:00"
+            outcome = "failed"
+            success = $false
+            results = [ordered]@{}
+        }
+    )
+    [IO.File]::WriteAllText(
+        (Join-Path $installRoot "state\run-history.jsonl"),
+        (
+            (($statusHistory | ForEach-Object {
+                $_ | ConvertTo-Json -Depth 8 -Compress
+            }) -join [Environment]::NewLine) +
+            [Environment]::NewLine
+        ),
         (New-Object Text.UTF8Encoding($false))
     )
     $status = & (Join-Path $repoRoot "status.ps1") `
@@ -262,8 +394,52 @@ try {
         "status exposes Claude action count"
     Assert-True ($status.CodexActionCount -eq 0) `
         "status exposes Codex action count"
+    Assert-True ($status.SuccessfulExecutedSlots -eq 1) `
+        "status counts successful executed slots"
+    Assert-True ($status.FailedExecutedSlots -eq 1) `
+        "status counts failed executed slots"
+    Assert-True ($status.MissedSlots -eq 3) `
+        "status counts slots inside grouped missed history"
+    Assert-True ($status.MissedGroups -eq 1) `
+        "status counts grouped missed records"
+    Assert-True (
+        $status.LastMissedSlot.ToString("o") -eq
+        "2026-07-26T20:00:00.0000000-06:00"
+    ) "status reports the last missed slot"
+    Assert-True ($status.LastMissedReason -eq "system_hibernating") `
+        "status reports the last missed reason"
+    Assert-True (
+        $status.LastSuccessfulSlot.ToString("o") -eq
+        "2026-07-26T05:00:00.0000000-06:00"
+    ) "status reports the last successful slot"
+    Assert-True ($status.PendingMissedSlots -eq 0) `
+        "a new future schedule has no pending missed slots"
+    Assert-True ([bool]$status.NextScheduledSlot) `
+        "status derives the next expected slot"
 
     if ($Live) {
+        $liveConfig = Get-Content -LiteralPath $configPath -Raw |
+            ConvertFrom-Json
+        $liveConfig.schedule = New-QuotaWakeSchedule `
+            -Mode Continuous `
+            -EffectiveFrom ([DateTimeOffset]::Now.AddSeconds(-1)) `
+            -TimeZoneId ([TimeZoneInfo]::Local.Id) `
+            -IntervalHours 1
+        $liveConfig.notificationsEnabled = $false
+        $liveScheduleId = $liveConfig.schedule.id
+        [IO.File]::WriteAllText(
+            $configPath,
+            ($liveConfig | ConvertTo-Json -Depth 8),
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $lastResultPath = Join-Path $installRoot "state\last-result.json"
+        $historyPath = Join-Path $installRoot "state\run-history.jsonl"
+        Remove-Item -LiteralPath $lastResultPath -Force -ErrorAction SilentlyContinue
+        [IO.File]::WriteAllText(
+            $historyPath,
+            "",
+            (New-Object Text.UTF8Encoding($false))
+        )
         $startedAt = Get-Date
         Start-ScheduledTask -TaskName $taskName
 
@@ -295,8 +471,11 @@ try {
         Assert-True $sawWorker "live worker process was observed"
         Assert-True (-not $sawVisibleWindow) "worker never owns a visible window"
 
-        $lastResultPath = Join-Path $installRoot "state\last-result.json"
         $lastResult = Get-Content -LiteralPath $lastResultPath -Raw | ConvertFrom-Json
+        Assert-True ($lastResult.scheduleId -eq $liveScheduleId) `
+            "scheduled result was freshly written for the live verification slot"
+        Assert-True ([DateTimeOffset]$lastResult.startedAt -ge $startedAt) `
+            "scheduled result was written after the live task started"
         Assert-True $lastResult.success "combined live result succeeds"
         Assert-True (@($lastResult.agents).Count -eq 2) `
             "combined live result contains both selected agents"

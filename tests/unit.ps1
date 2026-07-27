@@ -464,6 +464,236 @@ $defaultRoot = Get-DefaultInstallRoot
 Assert-True ([IO.Path]::IsPathRooted($defaultRoot)) "default install root is absolute"
 Assert-True ($defaultRoot.EndsWith("QuotaWake")) "default install root is product-scoped"
 
+$continuousSchedule = New-QuotaWakeSchedule `
+    -Mode Continuous `
+    -EffectiveFrom ([DateTimeOffset]::Parse("2026-07-27T03:39:27-06:00")) `
+    -TimeZoneId "Mountain Standard Time" `
+    -IntervalHours 5
+$sameContinuousSchedule = New-QuotaWakeSchedule `
+    -Mode Continuous `
+    -EffectiveFrom ([DateTimeOffset]::Parse("2026-07-27T03:39:27-06:00")) `
+    -TimeZoneId "Mountain Standard Time" `
+    -IntervalHours 5
+$changedContinuousSchedule = New-QuotaWakeSchedule `
+    -Mode Continuous `
+    -EffectiveFrom ([DateTimeOffset]::Parse("2026-07-27T03:39:27-06:00")) `
+    -TimeZoneId "Mountain Standard Time" `
+    -IntervalHours 4
+Assert-Equal $continuousSchedule.id $sameContinuousSchedule.id `
+    "identical schedules have stable identifiers"
+Assert-True ($continuousSchedule.id -ne $changedContinuousSchedule.id) `
+    "schedule identifiers change with scheduling inputs"
+
+$continuousSlots = @(Get-QuotaWakeExpectedSlots `
+    -Schedule $continuousSchedule `
+    -Through ([DateTimeOffset]::Parse("2026-07-28T05:00:00-06:00")))
+Assert-Equal 6 $continuousSlots.Count "continuous slots span multiple days"
+Assert-Equal "2026-07-28T04:39:27.0000000-06:00" `
+    $continuousSlots[-1].ToString("o") `
+    "continuous slots retain their local offset"
+Assert-Equal (
+    "$($continuousSchedule.id)|2026-07-28T10:39:27.0000000Z"
+) (Get-QuotaWakeSlotKey -ScheduleId $continuousSchedule.id -Slot $continuousSlots[-1]) `
+    "slot keys use schedule identity and UTC"
+
+$continuousDstSchedule = New-QuotaWakeSchedule `
+    -Mode Continuous `
+    -EffectiveFrom ([DateTimeOffset]::Parse("2026-10-31T23:39:27-06:00")) `
+    -TimeZoneId "Mountain Standard Time" `
+    -IntervalHours 5
+$continuousDstSlots = @(Get-QuotaWakeExpectedSlots `
+    -Schedule $continuousDstSchedule `
+    -Through ([DateTimeOffset]::Parse("2026-11-01T04:00:00-07:00")))
+Assert-Equal "2026-11-01T03:39:27.0000000-07:00" `
+    $continuousDstSlots[1].ToString("o") `
+    "continuous slots expose the offset effective after daylight saving ends"
+
+$imminentSchedule = New-QuotaWakeSchedule `
+    -Mode Continuous `
+    -EffectiveFrom ([DateTimeOffset]::Parse("2026-07-27T10:00:00-06:00")) `
+    -TimeZoneId "Mountain Standard Time" `
+    -IntervalHours 5
+$safeNextSlot = Get-QuotaWakeNextExpectedSlot `
+    -Schedule $imminentSchedule `
+    -NotBefore ([DateTimeOffset]::Parse("2026-07-27T10:00:10-06:00")) `
+    -Through ([DateTimeOffset]::Parse("2026-07-27T16:00:00-06:00"))
+Assert-Equal "2026-07-27T15:00:00.0000000-06:00" `
+    $safeNextSlot.ToString("o") `
+    "registration safety lead skips an imminent first slot"
+
+$onTime = Get-QuotaWakeInvocation `
+    -Schedule $continuousSchedule `
+    -InvocationTime ([DateTimeOffset]::Parse("2026-07-27T08:40:30-06:00")) `
+    -GraceSeconds 120
+$late = Get-QuotaWakeInvocation `
+    -Schedule $continuousSchedule `
+    -InvocationTime ([DateTimeOffset]::Parse("2026-07-27T08:41:28-06:00")) `
+    -GraceSeconds 120
+$early = Get-QuotaWakeInvocation `
+    -Schedule $continuousSchedule `
+    -InvocationTime ([DateTimeOffset]::Parse("2026-07-27T03:30:00-06:00")) `
+    -GraceSeconds 120
+Assert-True $onTime.IsLegitimate "launch inside grace is legitimate"
+Assert-True (-not $late.IsLegitimate) "launch after grace is rejected"
+Assert-True (-not $early.IsLegitimate) "launch before first slot is rejected"
+
+$dailySchedule = New-QuotaWakeSchedule `
+    -Mode Daily `
+    -EffectiveFrom ([DateTimeOffset]::Parse("2026-10-31T05:00:00-06:00")) `
+    -TimeZoneId "Mountain Standard Time" `
+    -DailyRunTimes @("01:30", "05:00")
+$dailySlots = @(Get-QuotaWakeExpectedSlots `
+    -Schedule $dailySchedule `
+    -Through ([DateTimeOffset]::Parse("2026-11-02T06:00:00-07:00")))
+Assert-Equal 5 $dailySlots.Count "daily slots span the daylight-saving transition"
+Assert-Equal "2026-11-01T05:00:00.0000000-07:00" `
+    $dailySlots[2].ToString("o") `
+    "daily slots use the offset effective on each local date"
+
+$hibernateReason = Get-QuotaWakeMissReason `
+    -Slot ([DateTimeOffset]::Parse("2026-07-27T08:39:27-06:00")) `
+    -EvidenceIntervals @([pscustomobject]@{
+        kind = "system_hibernating"
+        unavailableFrom = "2026-07-27T06:49:00-06:00"
+        availableAgainAt = "2026-07-27T11:44:00-06:00"
+        evidence = @()
+    })
+Assert-Equal "system_hibernating" $hibernateReason.code `
+    "hibernation evidence classifies a contained slot"
+Assert-Equal "confirmed" $hibernateReason.confidence `
+    "bounded hibernation evidence is confirmed"
+$offReason = Get-QuotaWakeMissReason `
+    -Slot ([DateTimeOffset]::Parse("2026-07-27T02:00:00-06:00")) `
+    -EvidenceIntervals @([pscustomobject]@{
+        kind = "system_off"
+        unavailableFrom = "2026-07-26T22:00:00-06:00"
+        availableAgainAt = "2026-07-27T05:00:00-06:00"
+        evidence = @()
+    })
+Assert-Equal "system_off" $offReason.code `
+    "shutdown-to-boot evidence classifies a contained slot"
+
+$availableReason = Get-QuotaWakeMissReason `
+    -Slot ([DateTimeOffset]::Parse("2026-07-27T13:39:27-06:00")) `
+    -EvidenceIntervals @([pscustomobject]@{
+        kind = "available"
+        availableFrom = "2026-07-27T11:44:00-06:00"
+        availableUntil = "2026-07-27T15:00:00-06:00"
+        evidence = @()
+    })
+Assert-Equal "scheduler_did_not_start" $availableReason.code `
+    "explicit availability evidence classifies scheduler failure"
+$laterAvailableReason = Get-QuotaWakeMissReason `
+    -Slot ([DateTimeOffset]::Parse("2026-07-27T16:39:27-06:00")) `
+    -EvidenceIntervals @([pscustomobject]@{
+        kind = "available"
+        availableFrom = "2026-07-27T15:00:00-06:00"
+        availableUntil = "2026-07-27T18:00:00-06:00"
+        evidence = @()
+    })
+$availabilityGroups = @(Group-QuotaWakeMissedSlots -ClassifiedSlots @(
+    [pscustomobject]@{
+        slot = [DateTimeOffset]::Parse("2026-07-27T13:39:27-06:00")
+        sequence = 0
+        reason = $availableReason
+    },
+    [pscustomobject]@{
+        slot = [DateTimeOffset]::Parse("2026-07-27T16:39:27-06:00")
+        sequence = 1
+        reason = $laterAvailableReason
+    }
+))
+Assert-Equal 2 $availabilityGroups.Count `
+    "distinct availability evidence intervals produce separate missed groups"
+$unknownReason = Get-QuotaWakeMissReason `
+    -Slot ([DateTimeOffset]::Parse("2026-07-20T13:39:27-06:00")) `
+    -EvidenceIntervals @()
+Assert-Equal "unknown" $unknownReason.code `
+    "missing evidence does not claim the system was off"
+
+$normalizedEvidence = @(ConvertTo-QuotaWakeEvidenceIntervals `
+    -Transitions @(
+        [pscustomobject]@{
+            kind = "available"
+            time = "2026-07-27T05:00:00-06:00"
+            evidence = [pscustomobject]@{
+                provider = "Microsoft-Windows-Kernel-General"
+                eventId = 12
+                time = "2026-07-27T05:00:00-06:00"
+            }
+        },
+        [pscustomobject]@{
+            kind = "system_hibernating"
+            time = "2026-07-27T06:49:00-06:00"
+            evidence = [pscustomobject]@{
+                provider = "Microsoft-Windows-Kernel-Power"
+                eventId = 42
+                time = "2026-07-27T06:49:00-06:00"
+            }
+        },
+        [pscustomobject]@{
+            kind = "available"
+            time = "2026-07-27T11:44:00-06:00"
+            evidence = [pscustomobject]@{
+                provider = "Microsoft-Windows-Power-Troubleshooter"
+                eventId = 1
+                time = "2026-07-27T11:44:00-06:00"
+            }
+        }
+    ) `
+    -Through ([DateTimeOffset]::Parse("2026-07-27T15:00:00-06:00")))
+Assert-Equal 3 $normalizedEvidence.Count `
+    "power transitions produce availability and unavailability intervals"
+Assert-Equal "system_hibernating" $normalizedEvidence[1].kind `
+    "sleep-to-resume becomes a hibernation interval"
+Assert-Equal 2 @($normalizedEvidence[1].evidence).Count `
+    "bounded unavailable interval retains both event identifiers"
+
+$powerTransitions = @(ConvertFrom-QuotaWakePowerTroubleshooterXml -Xml @'
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <EventData>
+    <Data Name="SleepTime">2026-07-27T12:49:49.1659930Z</Data>
+    <Data Name="WakeTime">2026-07-27T17:44:43.2828613Z</Data>
+    <Data Name="TargetState">5</Data>
+  </EventData>
+</Event>
+'@)
+Assert-Equal 2 $powerTransitions.Count `
+    "power troubleshooter payload yields sleep and wake transitions"
+Assert-Equal "system_hibernating" $powerTransitions[0].kind `
+    "embedded sleep time starts the unavailable interval"
+Assert-Equal "2026-07-27T17:44:43.2828613+00:00" `
+    $powerTransitions[1].time `
+    "embedded wake time survives strict-mode XML parsing"
+
+$classifiedMisses = @(
+    [pscustomobject]@{
+        slot = [DateTimeOffset]::Parse("2026-07-27T03:39:27-06:00")
+        sequence = 0
+        reason = $hibernateReason
+    },
+    [pscustomobject]@{
+        slot = [DateTimeOffset]::Parse("2026-07-27T08:39:27-06:00")
+        sequence = 1
+        reason = $hibernateReason
+    },
+    [pscustomobject]@{
+        slot = [DateTimeOffset]::Parse("2026-07-27T13:39:27-06:00")
+        sequence = 2
+        reason = $availableReason
+    },
+    [pscustomobject]@{
+        slot = [DateTimeOffset]::Parse("2026-07-27T23:39:27-06:00")
+        sequence = 4
+        reason = $availableReason
+    }
+)
+$missGroups = @(Group-QuotaWakeMissedSlots -ClassifiedSlots $classifiedMisses)
+Assert-Equal 3 $missGroups.Count `
+    "reason changes and recorded gaps split missed groups"
+Assert-Equal 2 @($missGroups[0].Slots).Count `
+    "same-cause consecutive misses share one group"
+
 $parseFailures = @()
 Get-ChildItem -Path $repoRoot -Recurse -Include *.ps1,*.psm1 | ForEach-Object {
     $tokens = $null

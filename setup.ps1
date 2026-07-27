@@ -40,7 +40,10 @@ param(
 
     [string]$InstallRoot,
 
-    [switch]$SkipLiveTest
+    [switch]$SkipLiveTest,
+
+    [Parameter(DontShow = $true)]
+    [switch]$AllowTestDemandStart
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,6 +56,9 @@ if ($env:OS -ne "Windows_NT") {
 $modulePath = Join-Path $PSScriptRoot "src\QuotaWake.psm1"
 Import-Module $modulePath -Force -DisableNameChecking
 Assert-QuotaWakeTaskName -TaskName $TaskName
+if ($AllowTestDemandStart -and $TaskName -notlike "QuotaWake-Test-*") {
+    throw "Demand starts may be enabled only for isolated QuotaWake-Test-* tasks."
+}
 $selectedAgents = @(Resolve-AgentSelection -Agents $Agents)
 $scheduleMode = "Continuous"
 $dailyRunTimes = @()
@@ -110,6 +116,23 @@ $stagingCodexInstructionsPath = Join-Path `
     "codex-instructions.txt"
 $stagingConfigPath = Join-Path $stagingRuntimeDirectory "config.json"
 $ownershipMarkerPath = Get-QuotaWakeOwnershipMarkerPath -InstallRoot $InstallRoot
+$pendingConfigPath = "$configPath.pending-$([Guid]::NewGuid().ToString('N'))"
+$configExistedBeforeSetup = Test-Path -LiteralPath $configPath -PathType Leaf
+$previousConfigContent = if ($configExistedBeforeSetup) {
+    Get-Content -LiteralPath $configPath -Raw
+}
+else {
+    $null
+}
+$markerExistedBeforeSetup = Test-Path `
+    -LiteralPath $ownershipMarkerPath `
+    -PathType Leaf
+$previousMarkerContent = if ($markerExistedBeforeSetup) {
+    Get-Content -LiteralPath $ownershipMarkerPath -Raw
+}
+else {
+    $null
+}
 $taskArguments = Get-QuotaWakeScheduledTaskArguments `
     -WorkerPath $installedWorkerPath `
     -ConfigPath $configPath
@@ -148,6 +171,108 @@ elseif (Test-Path -LiteralPath $InstallRoot) {
         }
     }
 }
+
+$timeZoneId = [TimeZoneInfo]::Local.Id
+$localTimeZone = [TimeZoneInfo]::FindSystemTimeZoneById($timeZoneId)
+$existingSchedule = $null
+if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+    try {
+        $existingConfig = Get-Content -LiteralPath $configPath -Raw |
+            ConvertFrom-Json
+        if (
+            [int]$existingConfig.schemaVersion -eq 4 -and
+            $existingConfig.PSObject.Properties["schedule"]
+        ) {
+            $candidate = $existingConfig.schedule
+            $sameSchedule = (
+                [string]$candidate.mode -eq $scheduleMode -and
+                [string]$candidate.timeZoneId -eq $timeZoneId
+            )
+            if ($sameSchedule -and $scheduleMode -eq "Continuous") {
+                $sameSchedule = (
+                    [int]$candidate.intervalHours -eq $IntervalHours
+                )
+            }
+            elseif ($sameSchedule) {
+                $candidateTimes = @($candidate.dailyRunTimes | ForEach-Object {
+                    [TimeSpan]::Parse([string]$_).ToString("hh\:mm\:ss")
+                })
+                $requestedTimes = @($dailyRunTimes | ForEach-Object {
+                    $_.ToString("hh\:mm\:ss")
+                })
+                $sameSchedule = (
+                    ($candidateTimes -join ",") -ceq
+                    ($requestedTimes -join ",")
+                )
+            }
+            if ($sameSchedule) {
+                $existingSchedule = $candidate
+            }
+        }
+    }
+    catch {
+        $existingSchedule = $null
+    }
+}
+
+if ($existingSchedule) {
+    $schedule = $existingSchedule
+}
+else {
+    $now = [DateTimeOffset]::Now
+    if ($scheduleMode -eq "Continuous") {
+        $nextMinute = $now.LocalDateTime.AddMinutes(2)
+        $firstLocalSlot = [DateTime]::new(
+            $nextMinute.Year,
+            $nextMinute.Month,
+            $nextMinute.Day,
+            $nextMinute.Hour,
+            $nextMinute.Minute,
+            0,
+            [DateTimeKind]::Unspecified
+        )
+        $firstSlot = [DateTimeOffset]::new(
+            $firstLocalSlot,
+            $localTimeZone.GetUtcOffset($firstLocalSlot)
+        )
+        $schedule = New-QuotaWakeSchedule `
+            -Mode Continuous `
+            -EffectiveFrom $firstSlot `
+            -TimeZoneId $timeZoneId `
+            -IntervalHours $IntervalHours
+    }
+    else {
+        $nextDailySlot = $null
+        foreach ($runTime in $dailyRunTimes) {
+            $candidateLocal = [DateTime]::SpecifyKind(
+                $now.Date.Add($runTime),
+                [DateTimeKind]::Unspecified
+            )
+            $candidate = [DateTimeOffset]::new(
+                $candidateLocal,
+                $localTimeZone.GetUtcOffset($candidateLocal)
+            )
+            if ($candidate -lt $now) {
+                $candidateLocal = $candidateLocal.AddDays(1)
+                $candidate = [DateTimeOffset]::new(
+                    $candidateLocal,
+                    $localTimeZone.GetUtcOffset($candidateLocal)
+                )
+            }
+            if ($null -eq $nextDailySlot -or $candidate -lt $nextDailySlot) {
+                $nextDailySlot = $candidate
+            }
+        }
+        $schedule = New-QuotaWakeSchedule `
+            -Mode Daily `
+            -EffectiveFrom $nextDailySlot `
+            -TimeZoneId $timeZoneId `
+            -DailyRunTimes @($dailyRunTimes | ForEach-Object {
+                $_.ToString("hh\:mm\:ss")
+            })
+    }
+}
+
 $prompt = (
     "Do not use tools, commands, files, network access, plugins, skills, " +
     "or external context. Perform no action other than replying with exactly: hi"
@@ -156,9 +281,11 @@ $codexInstructions = (
     "Do not use tools or external context. Reply with exactly: hi"
 )
 $config = [ordered]@{
-    schemaVersion    = 3
+    schemaVersion    = 4
     agents           = $selectedAgents
     scheduleMode     = $scheduleMode
+    schedule         = $schedule
+    graceSeconds     = 120
     timeoutSeconds   = $TimeoutSeconds
     notificationsEnabled = $false
     workingDirectory = $stagingProbeDirectory
@@ -191,10 +318,17 @@ try {
             -Path $stagingCodexInstructionsPath `
             -Content $codexInstructions
     }
+    $deploymentSchedule = $config["schedule"]
+    if (-not $SkipLiveTest) {
+        $config["schedule"] = New-QuotaWakeSchedule `
+            -Mode Continuous `
+            -EffectiveFrom ([DateTimeOffset]::Now.AddSeconds(-1)) `
+            -TimeZoneId $timeZoneId `
+            -IntervalHours 1
+    }
     Write-AtomicUtf8File `
         -Path $stagingConfigPath `
-        -Content ($config | ConvertTo-Json -Depth 5)
-
+        -Content ($config | ConvertTo-Json -Depth 8)
     if (-not $SkipLiveTest) {
         $liveOutput = & $powershellPath `
             -NoLogo `
@@ -236,6 +370,7 @@ try {
             }
             throw ($guidance -join [Environment]::NewLine)
         }
+        $config["schedule"] = $deploymentSchedule
     }
 
     [void](New-Item -ItemType Directory -Path $runtimeDirectory -Force)
@@ -253,17 +388,6 @@ try {
     $config["notificationsEnabled"] = $true
     $config["workingDirectory"] = $probeDirectory
     $config["stateDirectory"] = $stateDirectory
-    Write-AtomicUtf8File `
-        -Path $configPath `
-        -Content ($config | ConvertTo-Json -Depth 5)
-    Write-AtomicUtf8File `
-        -Path $ownershipMarkerPath `
-        -Content ([ordered]@{
-            product       = "QuotaWake"
-            schemaVersion = 1
-            installRoot   = $InstallRoot
-            taskName      = $TaskName
-        } | ConvertTo-Json)
 }
 finally {
     if (Test-Path -LiteralPath $stagingRoot) {
@@ -272,17 +396,60 @@ finally {
 }
 
 $triggers = @()
+$registrationSafetySeconds = 30
+$nowForTrigger = [DateTimeOffset]::Now
+if ($existingSchedule) {
+    $imminentExistingSlot = Get-QuotaWakeNextExpectedSlot `
+        -Schedule $schedule `
+        -NotBefore $nowForTrigger `
+        -Through $nowForTrigger.AddSeconds($registrationSafetySeconds)
+    if ($null -ne $imminentExistingSlot) {
+        $existingSchedule = $null
+    }
+}
 if ($scheduleMode -eq "Daily") {
+    $nextDailySlot = Get-QuotaWakeNextExpectedSlot `
+        -Schedule $schedule `
+        -NotBefore $nowForTrigger.AddSeconds($registrationSafetySeconds) `
+        -Through $nowForTrigger.AddDays(2)
+    if ($null -eq $nextDailySlot) {
+        throw "The next daily schedule slot could not be determined."
+    }
     foreach ($runTime in $dailyRunTimes) {
         $triggers += New-ScheduledTaskTrigger `
             -Daily `
-            -At ((Get-Date).Date.Add($runTime))
+            -At ($nowForTrigger.LocalDateTime.Date.Add($runTime))
+    }
+    if (-not $existingSchedule) {
+        $schedule = New-QuotaWakeSchedule `
+            -Mode Daily `
+            -EffectiveFrom $nextDailySlot `
+            -TimeZoneId $timeZoneId `
+            -DailyRunTimes @($dailyRunTimes | ForEach-Object {
+                $_.ToString("hh\:mm\:ss")
+            })
+        $config["schedule"] = $schedule
     }
 }
 else {
+    $nextContinuousSlot = Get-QuotaWakeNextExpectedSlot `
+        -Schedule $schedule `
+        -NotBefore $nowForTrigger.AddSeconds($registrationSafetySeconds) `
+        -Through $nowForTrigger.AddHours(($IntervalHours * 2) + 1)
+    if ($null -eq $nextContinuousSlot) {
+        throw "The next continuous schedule slot could not be determined."
+    }
+    if (-not $existingSchedule) {
+        $schedule = New-QuotaWakeSchedule `
+            -Mode Continuous `
+            -EffectiveFrom ([DateTimeOffset]$nextContinuousSlot) `
+            -TimeZoneId $timeZoneId `
+            -IntervalHours $IntervalHours
+        $config["schedule"] = $schedule
+    }
     $triggers += New-ScheduledTaskTrigger `
         -Once `
-        -At ((Get-Date).AddMinutes(1)) `
+        -At ([DateTimeOffset]$nextContinuousSlot).LocalDateTime `
         -RepetitionInterval (New-TimeSpan -Hours $IntervalHours) `
         -RepetitionDuration (New-TimeSpan -Days 3650)
 }
@@ -300,6 +467,8 @@ $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -WakeToRun
+$settings.StartWhenAvailable = $false
+$settings.AllowDemandStart = [bool]$AllowTestDemandStart
 
 $taskBeforeRegister = Get-ScheduledTask `
     -TaskPath "\" `
@@ -326,7 +495,103 @@ $registrationParameters = @{
 if ($taskBeforeRegister) {
     $registrationParameters["Force"] = $true
 }
-Register-ScheduledTask @registrationParameters | Out-Null
+$taskBeforeRegisterXml = if ($taskBeforeRegister) {
+    Export-ScheduledTask -TaskPath "\" -TaskName $TaskName
+}
+else {
+    $null
+}
+$ownershipMarkerContent = [ordered]@{
+    product       = "QuotaWake"
+    schemaVersion = 1
+    installRoot   = $InstallRoot
+    taskName      = $TaskName
+} | ConvertTo-Json
+try {
+    Write-AtomicUtf8File `
+        -Path $pendingConfigPath `
+        -Content ($config | ConvertTo-Json -Depth 8)
+    Register-ScheduledTask @registrationParameters | Out-Null
+    Move-Item `
+        -LiteralPath $pendingConfigPath `
+        -Destination $configPath `
+        -Force
+    Write-AtomicUtf8File `
+        -Path $ownershipMarkerPath `
+        -Content $ownershipMarkerContent
+}
+catch {
+    $setupFailure = $_
+    $rollbackErrors = New-Object Collections.Generic.List[string]
+    try {
+        if ($configExistedBeforeSetup) {
+            Write-AtomicUtf8File `
+                -Path $configPath `
+                -Content $previousConfigContent
+        }
+        elseif (Test-Path -LiteralPath $configPath -PathType Leaf) {
+            Remove-Item -LiteralPath $configPath -Force
+        }
+    }
+    catch {
+        $rollbackErrors.Add("configuration: $($_.Exception.Message)")
+    }
+    try {
+        if ($markerExistedBeforeSetup) {
+            Write-AtomicUtf8File `
+                -Path $ownershipMarkerPath `
+                -Content $previousMarkerContent
+        }
+        elseif (Test-Path -LiteralPath $ownershipMarkerPath -PathType Leaf) {
+            Remove-Item -LiteralPath $ownershipMarkerPath -Force
+        }
+    }
+    catch {
+        $rollbackErrors.Add("ownership marker: $($_.Exception.Message)")
+    }
+    try {
+        if ($taskBeforeRegisterXml) {
+            Register-ScheduledTask `
+                -TaskPath "\" `
+                -TaskName $TaskName `
+                -Xml $taskBeforeRegisterXml `
+                -Force | Out-Null
+        }
+        else {
+            $partialTask = Get-ScheduledTask `
+                -TaskPath "\" `
+                -TaskName $TaskName `
+                -ErrorAction SilentlyContinue
+            if (
+                $partialTask -and
+                (Test-QuotaWakeScheduledTaskOwnership `
+                    -Task $partialTask `
+                    -ExpectedExecute $powershellPath `
+                    -ExpectedArguments $taskArguments)
+            ) {
+                Unregister-ScheduledTask `
+                    -TaskPath "\" `
+                    -TaskName $TaskName `
+                    -Confirm:$false
+            }
+        }
+    }
+    catch {
+        $rollbackErrors.Add("scheduled task: $($_.Exception.Message)")
+    }
+    if ($rollbackErrors.Count -gt 0) {
+        throw (
+            "$($setupFailure.Exception.Message) Rollback also failed for " +
+            "$($rollbackErrors -join '; ')."
+        )
+    }
+    throw $setupFailure
+}
+finally {
+    if (Test-Path -LiteralPath $pendingConfigPath -PathType Leaf) {
+        Remove-Item -LiteralPath $pendingConfigPath -Force
+    }
+}
 
 $taskInfo = Get-ScheduledTaskInfo -TaskPath "\" -TaskName $TaskName
 [pscustomobject]@{
