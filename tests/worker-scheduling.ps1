@@ -18,7 +18,8 @@ function Invoke-Worker {
         -NonInteractive `
         -ExecutionPolicy Bypass `
         -File $WorkerPath `
-        -ConfigPath $ConfigPath 2>&1
+        -ConfigPath $ConfigPath `
+        -SuppressNotifications 2>&1
     $exitCode = $LASTEXITCODE
     $ErrorActionPreference = $previousPreference
     return [pscustomobject]@{
@@ -301,7 +302,8 @@ public static class Probe {
             -NonInteractive `
             -ExecutionPolicy Bypass `
             -File $WorkerPath `
-            -ConfigPath $ConfigPath 2>&1
+            -ConfigPath $ConfigPath `
+            -SuppressNotifications 2>&1
         [pscustomobject]@{
             ExitCode = $LASTEXITCODE
             Output = ($output -join "`n")

@@ -32,6 +32,8 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$ClaudeModel = "haiku",
 
+    [string]$ClaudeConfigDir,
+
     [ValidateNotNullOrEmpty()]
     [string]$CodexModel = "gpt-5.4-mini",
 
@@ -74,6 +76,9 @@ if (-not $InstallRoot) {
     $InstallRoot = Get-DefaultInstallRoot
 }
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot)
+if ($ClaudeConfigDir) {
+    $ClaudeConfigDir = [IO.Path]::GetFullPath($ClaudeConfigDir)
+}
 
 $powershellPath = Resolve-CommandPath "powershell.exe"
 $resolvedPaths = @{}
@@ -135,7 +140,8 @@ else {
 }
 $taskArguments = Get-QuotaWakeScheduledTaskArguments `
     -WorkerPath $installedWorkerPath `
-    -ConfigPath $configPath
+    -ConfigPath $configPath `
+    -SuppressNotifications:($TaskName -like "QuotaWake-Test-*")
 $existingTask = Get-ScheduledTask `
     -TaskPath "\" `
     -TaskName $TaskName `
@@ -297,6 +303,9 @@ if ($selectedAgents -contains "Claude") {
         model  = $ClaudeModel
         prompt = $prompt
     }
+    if ($ClaudeConfigDir) {
+        $config["claude"]["configDir"] = $ClaudeConfigDir
+    }
 }
 if ($selectedAgents -contains "Codex") {
     $config["codex"] = [ordered]@{
@@ -336,7 +345,8 @@ try {
             -NonInteractive `
             -ExecutionPolicy Bypass `
             -File $stagingWorkerPath `
-            -ConfigPath $stagingConfigPath
+            -ConfigPath $stagingConfigPath `
+            -SuppressNotifications
         if (
             $LASTEXITCODE -ne 0 -or
             -not (Test-ExactHi -Output ($liveOutput -join "`n"))

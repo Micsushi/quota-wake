@@ -20,6 +20,23 @@ A hidden Windows task that makes minimal Claude Code or Codex calls every five h
 selection, installs under `%LOCALAPPDATA%\QuotaWake`, and registers one hidden
 `QuotaWake` task. Defaults are Claude Haiku and GPT-5.4 mini.
 
+### Isolated Claude login
+
+Use a separate Claude profile so scheduled probes do not share OAuth refresh
+tokens with Claude Code in VS Code:
+
+```powershell
+$profile = "$env:LOCALAPPDATA\QuotaWake\claude-profile"
+$env:CLAUDE_CONFIG_DIR = $profile
+claude auth login
+.\setup.ps1 -Agents Claude,Codex -ClaudeConfigDir $profile
+Remove-Item Env:\CLAUDE_CONFIG_DIR
+```
+
+This can use the same Claude account, but the second login creates a separate
+OAuth token pair. Setup stores only the profile path and injects
+`CLAUDE_CONFIG_DIR` into Claude probes. It does not copy or store credentials.
+
 ## Schedule modes
 
 Without a start time, the first run is within two minutes and repeats continuously:
@@ -106,7 +123,8 @@ Unit and worker tests do not call either model. Safety and non-live integration
 tests create uniquely named temporary Scheduled Tasks and remove them. The
 integration suite requires both CLIs to cover every supported selection.
 `.\tests\integration.ps1 -Live` additionally makes real Claude and Codex calls
-and verifies the hidden scheduled execution.
+and verifies the hidden scheduled execution. Test runs suppress desktop failure
+notifications, including tests that deliberately use malformed configuration.
 
 Quota Wake stores no credentials. Sleeping computers may wake for a scheduled
 run. A powered-off or hibernating computer skips the model call; the missed

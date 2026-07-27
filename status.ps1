@@ -19,7 +19,8 @@ $workerPath = Join-Path $runtimeDirectory "run-quota-wake.ps1"
 $powershellPath = Resolve-CommandPath "powershell.exe"
 $expectedArguments = Get-QuotaWakeScheduledTaskArguments `
     -WorkerPath $workerPath `
-    -ConfigPath $configPath
+    -ConfigPath $configPath `
+    -SuppressNotifications:($TaskName -like "QuotaWake-Test-*")
 $task = Get-ScheduledTask `
     -TaskPath "\" `
     -TaskName $TaskName `

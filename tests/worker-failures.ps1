@@ -26,7 +26,8 @@ try {
         -NonInteractive `
         -ExecutionPolicy Bypass `
         -File (Join-Path $repoRoot "src\run-quota-wake.ps1") `
-        -ConfigPath $configPath 2>&1
+        -ConfigPath $configPath `
+        -SuppressNotifications 2>&1
     $exitCode = $LASTEXITCODE
     $ErrorActionPreference = $previousErrorActionPreference
 
@@ -71,7 +72,8 @@ try {
         -NonInteractive `
         -ExecutionPolicy Bypass `
         -File (Join-Path $repoRoot "src\run-quota-wake.ps1") `
-        -ConfigPath $invalidV4ConfigPath 2>&1
+        -ConfigPath $invalidV4ConfigPath `
+        -SuppressNotifications 2>&1
     $invalidV4ExitCode = $LASTEXITCODE
     $ErrorActionPreference = $previousErrorActionPreference
     Assert-True ($invalidV4ExitCode -ne 0) `
@@ -126,7 +128,8 @@ try {
         -NonInteractive `
         -ExecutionPolicy Bypass `
         -File (Join-Path $repoRoot "src\run-quota-wake.ps1") `
-        -ConfigPath $persistenceConfigPath 2>&1
+        -ConfigPath $persistenceConfigPath `
+        -SuppressNotifications 2>&1
     $exitCode = $LASTEXITCODE
     $ErrorActionPreference = $previousErrorActionPreference
 

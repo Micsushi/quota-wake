@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
-    [string]$ConfigPath = (Join-Path $PSScriptRoot "config.json")
+    [string]$ConfigPath = (Join-Path $PSScriptRoot "config.json"),
+
+    [switch]$SuppressNotifications
 )
 
 $ErrorActionPreference = "Stop"
@@ -251,6 +253,7 @@ try {
             -FilePath $specification.FilePath `
             -ArgumentList $specification.ArgumentList `
             -WorkingDirectory $specification.WorkingDirectory `
+            -EnvironmentVariables $specification.EnvironmentVariables `
             -OutputFormat $specification.OutputFormat `
             -Model $specification.Model
     }
@@ -406,8 +409,8 @@ if (-not $success) {
     $failedNames = @($combinedResult.results.Keys | Where-Object {
         -not $combinedResult.results[$_].success
     })
-    $notificationsEnabled = $true
-    if ($config) {
+    $notificationsEnabled = -not $SuppressNotifications
+    if ($notificationsEnabled -and $config) {
         $notificationsEnabled = Test-FailureNotificationEnabled -Config $config
     }
     if ($notificationsEnabled) {

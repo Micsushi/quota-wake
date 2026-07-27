@@ -20,7 +20,8 @@ $configPath = Join-Path $runtimeDirectory "config.json"
 $powershellPath = Resolve-CommandPath "powershell.exe"
 $expectedArguments = Get-QuotaWakeScheduledTaskArguments `
     -WorkerPath $workerPath `
-    -ConfigPath $configPath
+    -ConfigPath $configPath `
+    -SuppressNotifications:($TaskName -like "QuotaWake-Test-*")
 
 if (
     $RemoveData -and

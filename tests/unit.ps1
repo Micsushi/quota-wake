@@ -60,6 +60,7 @@ $testConfig = [pscustomobject]@{
         path = "C:\Tools\claude.exe"
         model = "haiku"
         prompt = "Reply with exactly: hi"
+        configDir = "C:\Quota Wake\claude-profile"
     }
 }
 $specifications = @(Get-AgentProcessSpecifications `
@@ -79,6 +80,9 @@ Assert-True ($specifications[0].ArgumentList -contains "--tools=") `
     "Claude disables tools for this probe"
 Assert-True ($specifications[0].ArgumentList -contains "--setting-sources=") `
     "Claude ignores setting sources for this probe"
+Assert-Equal "C:\Quota Wake\claude-profile" `
+    $specifications[0].EnvironmentVariables["CLAUDE_CONFIG_DIR"] `
+    "Claude uses the configured isolated credential directory"
 
 $codexConfig = [pscustomobject]@{
     workingDirectory = "C:\Quota Wake"
@@ -162,6 +166,14 @@ $expectedTaskArguments = Get-QuotaWakeScheduledTaskArguments `
     -ConfigPath "C:\Quota Wake\runtime\config.json"
 Assert-True ($expectedTaskArguments -match '-WindowStyle Hidden') `
     "scheduled task arguments keep the worker hidden"
+Assert-True ($expectedTaskArguments -notmatch '-SuppressNotifications') `
+    "production task arguments retain failure notifications"
+$testTaskArguments = Get-QuotaWakeScheduledTaskArguments `
+    -WorkerPath "C:\Quota Wake\runtime\run-quota-wake.ps1" `
+    -ConfigPath "C:\Quota Wake\runtime\config.json" `
+    -SuppressNotifications
+Assert-True ($testTaskArguments -match '-SuppressNotifications') `
+    "test task arguments suppress failure notifications"
 $ownedTask = [pscustomobject]@{
     Actions = @([pscustomobject]@{
         Execute = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"

@@ -63,10 +63,12 @@ function Get-QuotaWakeScheduledTaskArguments {
         [string]$WorkerPath,
 
         [Parameter(Mandatory = $true)]
-        [string]$ConfigPath
+        [string]$ConfigPath,
+
+        [switch]$SuppressNotifications
     )
 
-    return Join-CommandLineArguments -ArgumentList @(
+    $arguments = @(
         "-NoLogo",
         "-NoProfile",
         "-NonInteractive",
@@ -79,6 +81,10 @@ function Get-QuotaWakeScheduledTaskArguments {
         "-ConfigPath",
         $ConfigPath
     )
+    if ($SuppressNotifications) {
+        $arguments += "-SuppressNotifications"
+    }
+    return Join-CommandLineArguments -ArgumentList $arguments
 }
 
 function Assert-QuotaWakeTaskName {
@@ -400,12 +406,23 @@ function Get-AgentProcessSpecifications {
     }
     foreach ($agent in $Agents) {
         if ($agent -eq "Claude") {
+            $environmentVariables = @{}
+            $configDirProperty = $Config.claude.PSObject.Properties["configDir"]
+            if (
+                $configDirProperty -and
+                -not [string]::IsNullOrWhiteSpace([string]$configDirProperty.Value)
+            ) {
+                $environmentVariables["CLAUDE_CONFIG_DIR"] = (
+                    [string]$configDirProperty.Value
+                )
+            }
             [pscustomobject]@{
                 Name         = "Claude"
                 FilePath     = [string]$Config.claude.path
                 Model        = [string]$Config.claude.model
                 WorkingDirectory = $WorkingDirectory
                 OutputFormat = "ClaudeJson"
+                EnvironmentVariables = $environmentVariables
                 ArgumentList = @(
                     "-p",
                     [string]$Config.claude.prompt,
@@ -437,6 +454,7 @@ function Get-AgentProcessSpecifications {
             Model        = [string]$Config.codex.model
             WorkingDirectory = $WorkingDirectory
             OutputFormat = "CodexJson"
+            EnvironmentVariables = @{}
             ArgumentList = @(
                 "exec",
                 "--ephemeral",
@@ -511,6 +529,8 @@ function Start-HiddenProcess {
         [Parameter(Mandatory = $true)]
         [string]$WorkingDirectory,
 
+        [hashtable]$EnvironmentVariables = @{},
+
         [ValidateSet("Text", "ClaudeJson", "CodexJson")]
         [string]$OutputFormat = "Text",
 
@@ -526,6 +546,9 @@ function Start-HiddenProcess {
     $processInfo.RedirectStandardInput = $true
     $processInfo.RedirectStandardOutput = $true
     $processInfo.RedirectStandardError = $true
+    foreach ($entry in $EnvironmentVariables.GetEnumerator()) {
+        $processInfo.EnvironmentVariables[$entry.Key] = [string]$entry.Value
+    }
 
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $processInfo

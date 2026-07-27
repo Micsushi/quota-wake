@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
-    [switch]$Live
+    [switch]$Live,
+
+    [string]$ClaudeConfigDir
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,6 +22,10 @@ Import-Module `
 $suffix = [Guid]::NewGuid().ToString("N").Substring(0, 8)
 $taskName = "QuotaWake-Test-$suffix"
 $installRoot = Join-Path $env:TEMP "Quota Wake Test $suffix"
+if (-not $ClaudeConfigDir) {
+    $ClaudeConfigDir = Join-Path $installRoot "claude-profile"
+}
+$ClaudeConfigDir = [IO.Path]::GetFullPath($ClaudeConfigDir)
 
 try {
     $missingSelectionError = $null
@@ -44,6 +50,7 @@ try {
     $continuousSetupStarted = Get-Date
     $continuousSetup = & (Join-Path $repoRoot "setup.ps1") `
         -Agents Claude `
+        -ClaudeConfigDir $ClaudeConfigDir `
         -TaskName $taskName `
         -InstallRoot $installRoot `
         -SkipLiveTest
@@ -103,6 +110,9 @@ try {
         $singleAgentConfig.claude.prompt -match
         "Do not use tools.*Perform no action.*exactly: hi"
     ) "setup stores an explicit no-action prompt"
+    Assert-True (
+        $singleAgentConfig.claude.configDir -eq $ClaudeConfigDir
+    ) "setup stores the isolated Claude credential directory"
     $continuousTask = Get-ScheduledTask -TaskName $taskName
     $continuousInfo = Get-ScheduledTaskInfo -TaskName $taskName
     Assert-True ($continuousTask.Triggers.Count -eq 1) `
@@ -146,7 +156,8 @@ try {
             -NonInteractive `
             -ExecutionPolicy Bypass `
             -File (Join-Path $installRoot "runtime\run-quota-wake.ps1") `
-            -ConfigPath $configPath
+            -ConfigPath $configPath `
+            -SuppressNotifications
         Assert-True ($LASTEXITCODE -eq 0) "single-agent worker exits zero"
         Assert-True (($singleOutput -join "`n").Trim() -ceq "hi") `
             "single-agent worker returns exact hi"
@@ -299,6 +310,8 @@ try {
     Assert-True ($action.Arguments -match "-WindowStyle Hidden") "task is hidden"
     Assert-True ($action.Arguments -match [regex]::Escape($installRoot)) `
         "task supports install paths with spaces"
+    Assert-True ($action.Arguments -match "-SuppressNotifications") `
+        "temporary test tasks suppress failure notifications"
     Assert-True (-not $tasks[0].Settings.DisallowStartIfOnBatteries) `
         "task can start on battery"
     Assert-True (-not $tasks[0].Settings.StopIfGoingOnBatteries) `
