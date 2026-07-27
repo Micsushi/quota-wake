@@ -45,6 +45,30 @@ try {
         -SkipLiveTest
 
     $configPath = Join-Path $installRoot "runtime\config.json"
+    Assert-True (
+        Test-Path `
+            -LiteralPath (Join-Path $installRoot "quota-wake-install.json") `
+            -PathType Leaf
+    ) "setup writes install ownership proof"
+    $conflictingTaskName = "$taskName-Other"
+    $conflictingSetupError = $null
+    try {
+        & (Join-Path $repoRoot "setup.ps1") `
+            -Agents Claude `
+            -TaskName $conflictingTaskName `
+            -InstallRoot $installRoot `
+            -SkipLiveTest | Out-Null
+    }
+    catch {
+        $conflictingSetupError = $_.Exception.Message
+    }
+    Assert-True ($conflictingSetupError -match "ownership") `
+        "one install root cannot be shared by two tasks"
+    Assert-True (-not (Get-ScheduledTask `
+        -TaskPath "\" `
+        -TaskName $conflictingTaskName `
+        -ErrorAction SilentlyContinue)) `
+        "conflicting setup does not create a second task"
     $singleAgentConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
     Assert-True ($singleAgentConfig.scheduleMode -eq "Continuous") `
         "omitting StartTime selects continuous mode"
@@ -167,9 +191,6 @@ try {
     $installedConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
     Assert-True ($installedConfig.scheduleMode -eq "Daily") `
         "providing StartTime selects daily mode"
-    Assert-True ((@($installedConfig.dailyRunTimes) -join ",") -eq `
-        "05:00,10:00,15:00,20:00") `
-        "daily mode stores only same-day five-hour slots"
     Assert-True ([bool]$installedConfig.notificationsEnabled) `
         "installed runs retain failure notifications"
     Assert-True (
@@ -226,6 +247,9 @@ try {
         -TaskName $taskName `
         -InstallRoot $installRoot
     Assert-True ($status.Installed) "status sees installed task"
+    Assert-True ($status.InstallOwned) "status verifies install ownership"
+    Assert-True (-not $status.OwnershipConflict) `
+        "status verifies scheduled task ownership"
     Assert-True (@($status.Agents).Count -eq 2) `
         "status reports the configured agents"
     Assert-True ($status.ScheduleMode -eq "Daily") `

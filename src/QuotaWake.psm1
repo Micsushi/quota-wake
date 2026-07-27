@@ -56,6 +56,87 @@ function Join-CommandLineArguments {
     }) -join ' ')
 }
 
+function Get-QuotaWakeScheduledTaskArguments {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$WorkerPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigPath
+    )
+
+    return Join-CommandLineArguments -ArgumentList @(
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        $WorkerPath,
+        "-ConfigPath",
+        $ConfigPath
+    )
+}
+
+function Assert-QuotaWakeTaskName {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TaskName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TaskName)) {
+        throw "TaskName cannot be empty."
+    }
+    if ($TaskName.IndexOfAny([char[]]"*?[]") -ge 0) {
+        throw "TaskName cannot contain wildcard characters."
+    }
+    if ($TaskName.Contains('\') -or $TaskName.Contains('/')) {
+        throw "TaskName must identify one task in the root task folder."
+    }
+}
+
+function Test-QuotaWakeScheduledTaskOwnership {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Task,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedExecute,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedArguments
+    )
+
+    $actions = @($Task.Actions)
+    if ($actions.Count -ne 1) {
+        return $false
+    }
+
+    $action = $actions[0]
+    try {
+        return (
+            [string]::Equals(
+                [IO.Path]::GetFullPath([string]$action.Execute),
+                [IO.Path]::GetFullPath($ExpectedExecute),
+                [StringComparison]::OrdinalIgnoreCase
+            ) -and
+            [string]::Equals(
+                [string]$action.Arguments,
+                $ExpectedArguments,
+                [StringComparison]::Ordinal
+            )
+        )
+    }
+    catch {
+        return $false
+    }
+}
+
 function Resolve-CommandPath {
     [CmdletBinding()]
     param(
@@ -90,6 +171,70 @@ function Get-DefaultInstallRoot {
         throw "Windows LocalApplicationData is unavailable."
     }
     return Join-Path $localApplicationData "QuotaWake"
+}
+
+function Get-QuotaWakeOwnershipMarkerPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$InstallRoot
+    )
+
+    return Join-Path ([IO.Path]::GetFullPath($InstallRoot)) "quota-wake-install.json"
+}
+
+function Test-QuotaWakeInstallOwnership {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$InstallRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TaskName
+    )
+
+    $resolvedInstallRoot = [IO.Path]::GetFullPath($InstallRoot)
+    $markerPath = Get-QuotaWakeOwnershipMarkerPath -InstallRoot $resolvedInstallRoot
+    if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
+        return $false
+    }
+
+    try {
+        $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+    }
+    catch {
+        return $false
+    }
+    foreach ($propertyName in @("product", "schemaVersion", "installRoot", "taskName")) {
+        if (-not $marker.PSObject.Properties[$propertyName]) {
+            return $false
+        }
+    }
+    try {
+        if (
+            $marker.product -cne "QuotaWake" -or
+            [int]$marker.schemaVersion -ne 1 -or
+            -not [string]::Equals(
+                [IO.Path]::GetFullPath([string]$marker.installRoot),
+                $resolvedInstallRoot,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -or
+            $marker.taskName -cne $TaskName
+        ) {
+            return $false
+        }
+
+        $runtimeDirectory = Join-Path $resolvedInstallRoot "runtime"
+        foreach ($name in @("config.json", "QuotaWake.psm1", "run-quota-wake.ps1")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $runtimeDirectory $name) -PathType Leaf)) {
+                return $false
+            }
+        }
+    }
+    catch {
+        return $false
+    }
+    return $true
 }
 
 function Resolve-CodexCommandPath {
@@ -245,15 +390,21 @@ function Get-AgentProcessSpecifications {
         [string[]]$Agents,
 
         [Parameter(Mandatory = $true)]
-        $Config
+        $Config,
+
+        [string]$WorkingDirectory
     )
 
+    if (-not $WorkingDirectory) {
+        $WorkingDirectory = [string]$Config.workingDirectory
+    }
     foreach ($agent in $Agents) {
         if ($agent -eq "Claude") {
             [pscustomobject]@{
                 Name         = "Claude"
                 FilePath     = [string]$Config.claude.path
                 Model        = [string]$Config.claude.model
+                WorkingDirectory = $WorkingDirectory
                 OutputFormat = "ClaudeJson"
                 ArgumentList = @(
                     "-p",
@@ -284,6 +435,7 @@ function Get-AgentProcessSpecifications {
             Name         = "Codex"
             FilePath     = [string]$Config.codex.path
             Model        = [string]$Config.codex.model
+            WorkingDirectory = $WorkingDirectory
             OutputFormat = "CodexJson"
             ArgumentList = @(
                 "exec",
@@ -336,7 +488,7 @@ function Get-AgentProcessSpecifications {
                 "-s",
                 "read-only",
                 "-C",
-                [string]$Config.workingDirectory,
+                $WorkingDirectory,
                 [string]$Config.codex.prompt
             )
         }
@@ -393,6 +545,36 @@ function Start-HiddenProcess {
     }
 }
 
+function Stop-QuotaWakeProcessTree {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [Diagnostics.Process]$Process
+    )
+
+    if ($Process.HasExited) {
+        return
+    }
+
+    $taskkillPath = Join-Path $env:SystemRoot "System32\taskkill.exe"
+    if (Test-Path -LiteralPath $taskkillPath -PathType Leaf) {
+        try {
+            & $taskkillPath `
+                /PID $Process.Id `
+                /T `
+                /F 2>$null | Out-Null
+        }
+        catch {
+        }
+    }
+    if (-not $Process.HasExited) {
+        $Process.Kill()
+    }
+    if (-not $Process.WaitForExit(5000)) {
+        throw "Process tree did not stop within five seconds."
+    }
+}
+
 function Complete-HiddenProcess {
     [CmdletBinding()]
     param(
@@ -411,8 +593,7 @@ function Complete-HiddenProcess {
         )
         if (-not $process.WaitForExit($remaining)) {
             try {
-                $process.Kill()
-                $process.WaitForExit()
+                Stop-QuotaWakeProcessTree -Process $process
             }
             catch {
             }
@@ -524,6 +705,24 @@ function Write-AtomicUtf8File {
     }
 }
 
+function New-QuotaWakeRunDirectory {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BaseDirectory
+    )
+
+    $resolvedBaseDirectory = [IO.Path]::GetFullPath($BaseDirectory)
+    if (-not (Test-Path -LiteralPath $resolvedBaseDirectory)) {
+        [void](New-Item -ItemType Directory -Path $resolvedBaseDirectory -Force)
+    }
+    $runDirectory = Join-Path `
+        $resolvedBaseDirectory `
+        "run-$([Guid]::NewGuid().ToString('N'))"
+    [void](New-Item -ItemType Directory -Path $runDirectory)
+    return $runDirectory
+}
+
 function Test-FailureNotificationEnabled {
     [CmdletBinding()]
     param(
@@ -602,28 +801,6 @@ function Get-QuotaWakeDailyRunTimes {
     return $runTimes.ToArray()
 }
 
-function Get-QuotaWakeNextDailyRun {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [TimeSpan[]]$RunTimes,
-
-        [Parameter(Mandatory = $true)]
-        [DateTime]$Now
-    )
-
-    if ($RunTimes.Count -eq 0) {
-        throw "Daily mode requires at least one run time."
-    }
-    foreach ($runTime in $RunTimes | Sort-Object) {
-        $candidate = $Now.Date.Add($runTime)
-        if ($candidate -gt $Now) {
-            return $candidate
-        }
-    }
-    return $Now.Date.AddDays(1).Add(($RunTimes | Sort-Object | Select-Object -First 1))
-}
-
 function Format-QuotaWakeNextRunMessage {
     [CmdletBinding()]
     param(
@@ -643,6 +820,23 @@ function Format-QuotaWakeNextRunMessage {
         $day = $NextRunTime.ToString("dddd, MMMM d")
     }
     return "Quota Wake is ready. Next run: $day at $($NextRunTime.ToString('h:mm tt'))."
+}
+
+function Get-OptionalInt64Property {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $property = $InputObject.PSObject.Properties[$Name]
+    if (-not $property -or $null -eq $property.Value) {
+        return [long]0
+    }
+    return [long]$property.Value
 }
 
 function ConvertFrom-ClaudeProbeOutput {
@@ -678,8 +872,12 @@ function ConvertFrom-ClaudeProbeOutput {
             Select-Object -First 1
     }
     $inputTokens = [long]$data.usage.input_tokens
-    $cacheCreationTokens = [long]$data.usage.cache_creation_input_tokens
-    $cacheReadTokens = [long]$data.usage.cache_read_input_tokens
+    $cacheCreationTokens = Get-OptionalInt64Property `
+        -InputObject $data.usage `
+        -Name "cache_creation_input_tokens"
+    $cacheReadTokens = Get-OptionalInt64Property `
+        -InputObject $data.usage `
+        -Name "cache_read_input_tokens"
     $outputTokens = [long]$data.usage.output_tokens
     [pscustomobject]@{
         text  = [string]$data.result
@@ -730,16 +928,19 @@ function ConvertFrom-CodexProbeOutput {
             throw "Codex returned invalid structured output."
         }
     }
-    $messageEvent = $events |
+    $messageEvents = @($events |
         Where-Object {
             $_.type -eq "item.completed" -and
             $_.item.type -eq "agent_message"
-        } |
-        Select-Object -Last 1
-    $usageEvent = $events |
-        Where-Object { $_.type -eq "turn.completed" } |
-        Select-Object -Last 1
-    if (-not $messageEvent -or -not $usageEvent -or -not $usageEvent.usage) {
+        })
+    $usageEvents = @($events |
+        Where-Object { $_.type -eq "turn.completed" })
+    if ($messageEvents.Count -ne 1 -or $usageEvents.Count -ne 1) {
+        throw "Codex structured output must contain exactly one result and usage event."
+    }
+    $messageEvent = $messageEvents[0]
+    $usageEvent = $usageEvents[0]
+    if (-not $usageEvent.usage) {
         throw "Codex structured output did not include result and usage data."
     }
     $actionEvents = @($events | Where-Object {
@@ -756,16 +957,25 @@ function ConvertFrom-CodexProbeOutput {
 
     $inputTokens = [long]$usageEvent.usage.input_tokens
     $outputTokens = [long]$usageEvent.usage.output_tokens
+    $cachedInputTokens = Get-OptionalInt64Property `
+        -InputObject $usageEvent.usage `
+        -Name "cached_input_tokens"
+    $cacheWriteInputTokens = Get-OptionalInt64Property `
+        -InputObject $usageEvent.usage `
+        -Name "cache_write_input_tokens"
+    $reasoningOutputTokens = Get-OptionalInt64Property `
+        -InputObject $usageEvent.usage `
+        -Name "reasoning_output_tokens"
     [pscustomobject]@{
         text  = [string]$messageEvent.item.text
         model = $Model
         actionCount = 0
         usage = [pscustomobject]@{
             inputTokens          = $inputTokens
-            cachedInputTokens    = [long]$usageEvent.usage.cached_input_tokens
-            cacheWriteInputTokens = [long]$usageEvent.usage.cache_write_input_tokens
+            cachedInputTokens    = $cachedInputTokens
+            cacheWriteInputTokens = $cacheWriteInputTokens
             outputTokens         = $outputTokens
-            reasoningOutputTokens = [long]$usageEvent.usage.reasoning_output_tokens
+            reasoningOutputTokens = $reasoningOutputTokens
             totalTokens          = $inputTokens + $outputTokens
             costUsd              = $null
         }
@@ -802,21 +1012,27 @@ function Show-QuotaWakeFailureNotification {
 Export-ModuleMember -Function @(
     "Quote-CommandLineArgument",
     "Join-CommandLineArguments",
+    "Get-QuotaWakeScheduledTaskArguments",
+    "Assert-QuotaWakeTaskName",
+    "Test-QuotaWakeScheduledTaskOwnership",
     "Resolve-CommandPath",
     "Resolve-CodexCommandPath",
     "Get-DefaultInstallRoot",
+    "Get-QuotaWakeOwnershipMarkerPath",
+    "Test-QuotaWakeInstallOwnership",
     "Test-ExactHi",
     "Get-AgentSetupHelp",
     "Resolve-AgentSelection",
     "Get-AgentFailureGuidance",
     "Get-AgentProcessSpecifications",
     "Start-HiddenProcess",
+    "Stop-QuotaWakeProcessTree",
     "Complete-HiddenProcess",
     "Write-AtomicUtf8File",
+    "New-QuotaWakeRunDirectory",
     "Test-FailureNotificationEnabled",
     "ConvertTo-QuotaWakeTime",
     "Get-QuotaWakeDailyRunTimes",
-    "Get-QuotaWakeNextDailyRun",
     "Format-QuotaWakeNextRunMessage",
     "ConvertFrom-ClaudeProbeOutput",
     "ConvertFrom-CodexProbeOutput",

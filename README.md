@@ -55,6 +55,10 @@ are not. Each probe runs from an empty directory with tools and project/user
 instructions disabled for that call only. Claude's system prompt and Codex's
 base instructions are replaced with probe-only instructions.
 
+`OwnershipConflict` reports a same-named Scheduled Task that Quota Wake will
+not replace or remove. `InstallOwned` confirms the local files carry matching
+ownership proof.
+
 ## Uninstall
 
 ```powershell
@@ -62,6 +66,24 @@ base instructions are replaced with probe-only instructions.
 ```
 
 Add `-RemoveData` to also delete local logs and configuration.
+
+Recursive removal requires the ownership file written by current setup
+versions. Rerun setup once before using `-RemoveData` on an older installation.
+
+## Tests
+
+```powershell
+.\tests\unit.ps1
+.\tests\worker-failures.ps1
+.\tests\safety.ps1
+.\tests\integration.ps1
+```
+
+Unit and worker tests do not call either model. Safety and non-live integration
+tests create uniquely named temporary Scheduled Tasks and remove them. The
+integration suite requires both CLIs to cover every supported selection.
+`.\tests\integration.ps1 -Live` additionally makes real Claude and Codex calls
+and verifies the hidden scheduled execution.
 
 Quota Wake stores no credentials. Sleeping computers may wake for a scheduled
 run. Powered-off computers skip missed slots.

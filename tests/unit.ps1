@@ -91,7 +91,8 @@ $codexConfig = [pscustomobject]@{
 }
 $codexSpecifications = @(Get-AgentProcessSpecifications `
     -Agents @("Codex") `
-    -Config $codexConfig)
+    -Config $codexConfig `
+    -WorkingDirectory "C:\Quota Wake\probe\run-test")
 Assert-Equal 1 $codexSpecifications.Count "Codex can be selected by itself"
 Assert-Equal "Codex" $codexSpecifications[0].Name `
     "Codex process specification is selected"
@@ -99,6 +100,9 @@ Assert-Equal "CodexJson" $codexSpecifications[0].OutputFormat `
     "Codex uses structured output"
 Assert-True ($codexSpecifications[0].ArgumentList -contains "--json") `
     "Codex requests JSONL output"
+Assert-True (
+    $codexSpecifications[0].ArgumentList -contains "C:\Quota Wake\probe\run-test"
+) "Codex receives the unique per-run working directory"
 foreach ($feature in @(
     "shell_tool",
     "plugins",
@@ -153,6 +157,107 @@ Assert-True (Test-FailureNotificationEnabled $notificationsEnabled) `
 Assert-True (Test-FailureNotificationEnabled $legacyNotificationConfig) `
     "legacy configurations retain failure notifications"
 
+$expectedTaskArguments = Get-QuotaWakeScheduledTaskArguments `
+    -WorkerPath "C:\Quota Wake\runtime\run-quota-wake.ps1" `
+    -ConfigPath "C:\Quota Wake\runtime\config.json"
+Assert-True ($expectedTaskArguments -match '-WindowStyle Hidden') `
+    "scheduled task arguments keep the worker hidden"
+$ownedTask = [pscustomobject]@{
+    Actions = @([pscustomobject]@{
+        Execute = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        Arguments = $expectedTaskArguments
+    })
+}
+$foreignTask = [pscustomobject]@{
+    Actions = @([pscustomobject]@{
+        Execute = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        Arguments = "-File C:\Other\worker.ps1"
+    })
+}
+Assert-True (Test-QuotaWakeScheduledTaskOwnership `
+    -Task $ownedTask `
+    -ExpectedExecute $ownedTask.Actions[0].Execute `
+    -ExpectedArguments $expectedTaskArguments) `
+    "matching task action is recognized as Quota Wake"
+Assert-True (-not (Test-QuotaWakeScheduledTaskOwnership `
+    -Task $foreignTask `
+    -ExpectedExecute $ownedTask.Actions[0].Execute `
+    -ExpectedArguments $expectedTaskArguments)) `
+    "a task with the same name but different action is not owned"
+
+$unsafeTaskNameError = $null
+try {
+    Assert-QuotaWakeTaskName -TaskName "Quota*"
+}
+catch {
+    $unsafeTaskNameError = $_.Exception.Message
+}
+Assert-True ($unsafeTaskNameError -match "wildcard") `
+    "task names reject wildcard characters before ScheduledTasks cmdlets"
+
+$ownershipRoot = Join-Path `
+    ([IO.Path]::GetTempPath()) `
+    "QuotaWake-Ownership-$([Guid]::NewGuid().ToString('N'))"
+try {
+    $ownershipRuntime = Join-Path $ownershipRoot "runtime"
+    [void](New-Item -ItemType Directory -Path $ownershipRuntime -Force)
+    foreach ($name in @("config.json", "QuotaWake.psm1", "run-quota-wake.ps1")) {
+        [IO.File]::WriteAllText((Join-Path $ownershipRuntime $name), "")
+    }
+    $ownershipMarkerPath = Get-QuotaWakeOwnershipMarkerPath `
+        -InstallRoot $ownershipRoot
+    [IO.File]::WriteAllText(
+        $ownershipMarkerPath,
+        ([ordered]@{
+            product = "QuotaWake"
+            schemaVersion = 1
+            installRoot = [IO.Path]::GetFullPath($ownershipRoot)
+            taskName = "QuotaWake-Test"
+        } | ConvertTo-Json)
+    )
+    Assert-True (Test-QuotaWakeInstallOwnership `
+        -InstallRoot $ownershipRoot `
+        -TaskName "QuotaWake-Test") `
+        "matching marker and runtime identify an owned install root"
+    Assert-True (-not (Test-QuotaWakeInstallOwnership `
+        -InstallRoot $ownershipRoot `
+        -TaskName "Different-Task")) `
+        "one install root cannot be shared by a different task"
+    [IO.File]::WriteAllText(
+        $ownershipMarkerPath,
+        '{"product":"QuotaWake","schemaVersion":"invalid","installRoot":"bad","taskName":"QuotaWake-Test"}'
+    )
+    Assert-True (-not (Test-QuotaWakeInstallOwnership `
+        -InstallRoot $ownershipRoot `
+        -TaskName "QuotaWake-Test")) `
+        "corrupt ownership proof is rejected without crashing status or uninstall"
+}
+finally {
+    if (Test-Path -LiteralPath $ownershipRoot) {
+        Remove-Item -LiteralPath $ownershipRoot -Recurse -Force
+    }
+}
+
+$probeRoot = Join-Path `
+    ([IO.Path]::GetTempPath()) `
+    "QuotaWake-Probe-$([Guid]::NewGuid().ToString('N'))"
+try {
+    [void](New-Item -ItemType Directory -Path $probeRoot -Force)
+    [IO.File]::WriteAllText((Join-Path $probeRoot "old-residue.txt"), "old")
+    $runDirectory = New-QuotaWakeRunDirectory -BaseDirectory $probeRoot
+    Assert-Equal ([IO.Path]::GetFullPath($probeRoot)) `
+        (Split-Path -Parent $runDirectory) `
+        "per-run probe directory is created under the configured root"
+    Assert-Equal 0 `
+        @(Get-ChildItem -LiteralPath $runDirectory -Force).Count `
+        "each run starts in an empty directory despite old root residue"
+}
+finally {
+    if (Test-Path -LiteralPath $probeRoot) {
+        Remove-Item -LiteralPath $probeRoot -Recurse -Force
+    }
+}
+
 $fiveAm = ConvertTo-QuotaWakeTime "5"
 Assert-Equal ([TimeSpan]::FromHours(5)) $fiveAm "bare hour means local 24-hour time"
 Assert-Equal ([TimeSpan]::FromHours(5)) `
@@ -182,15 +287,6 @@ Assert-Equal 4 $dailyRunTimes.Count "daily mode stops before crossing midnight"
 Assert-Equal "05:00,10:00,15:00,20:00" `
     (($dailyRunTimes | ForEach-Object { $_.ToString("hh\:mm") }) -join ",") `
     "daily mode resets at the start time each day"
-
-$morning = [datetime]"2026-07-26T08:00:00"
-$evening = [datetime]"2026-07-26T20:01:00"
-Assert-Equal ([datetime]"2026-07-26T10:00:00") `
-    (Get-QuotaWakeNextDailyRun -RunTimes $dailyRunTimes -Now $morning) `
-    "daily mode chooses the next remaining slot today"
-Assert-Equal ([datetime]"2026-07-27T05:00:00") `
-    (Get-QuotaWakeNextDailyRun -RunTimes $dailyRunTimes -Now $evening) `
-    "daily mode returns to its start time tomorrow"
 
 $nextRunMessage = Format-QuotaWakeNextRunMessage `
     -NextRunTime ([datetime]"2026-07-27T05:00:00") `
@@ -230,10 +326,25 @@ Assert-Equal 4 $claudeProbe.usage.outputTokens "Claude output tokens are recorde
 Assert-Equal 214 $claudeProbe.usage.totalTokens "Claude total tokens are normalized"
 Assert-Equal 0.0012 $claudeProbe.usage.costUsd "Claude reported cost is recorded"
 
+$minimalClaudeProbe = ConvertFrom-ClaudeProbeOutput -Output @'
+{
+  "result": "hi",
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 4
+  },
+  "permission_denials": []
+}
+'@
+Assert-Equal 0 $minimalClaudeProbe.usage.cacheCreationInputTokens `
+    "missing optional Claude cache-creation tokens default to zero"
+Assert-Equal 0 $minimalClaudeProbe.usage.cacheReadInputTokens `
+    "missing optional Claude cache-read tokens default to zero"
+
 $codexFixture = @'
 {"type":"thread.started","thread_id":"redacted"}
 {"type":"item.completed","item":{"type":"agent_message","text":"hi"}}
-{"type":"turn.completed","usage":{"input_tokens":140,"cached_input_tokens":40,"cache_write_input_tokens":0,"output_tokens":12,"reasoning_output_tokens":7}}
+{"type":"turn.completed","usage":{"input_tokens":140,"cached_input_tokens":40,"output_tokens":12}}
 '@
 $codexProbe = ConvertFrom-CodexProbeOutput `
     -Output $codexFixture `
@@ -245,9 +356,23 @@ Assert-Equal 140 $codexProbe.usage.inputTokens "Codex input tokens are recorded"
 Assert-Equal 40 $codexProbe.usage.cachedInputTokens `
     "Codex cached input tokens are recorded"
 Assert-Equal 12 $codexProbe.usage.outputTokens "Codex output tokens are recorded"
-Assert-Equal 7 $codexProbe.usage.reasoningOutputTokens `
-    "Codex reasoning tokens are recorded"
+Assert-Equal 0 $codexProbe.usage.reasoningOutputTokens `
+    "missing optional Codex reasoning tokens default to zero"
 Assert-Equal 152 $codexProbe.usage.totalTokens "Codex total tokens are normalized"
+
+$multipleCodexMessagesError = $null
+try {
+    [void](ConvertFrom-CodexProbeOutput -Model "gpt-test-mini" -Output @'
+{"type":"item.completed","item":{"type":"agent_message","text":"unexpected"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}
+{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}
+'@)
+}
+catch {
+    $multipleCodexMessagesError = $_.Exception.Message
+}
+Assert-True ($multipleCodexMessagesError -match "exactly one") `
+    "multiple Codex messages invalidate an exact-output probe"
 
 $missingUsageError = $null
 try {
@@ -294,11 +419,46 @@ $powershellPath = Resolve-CommandPath "powershell.exe"
 Assert-True ([IO.Path]::IsPathRooted($powershellPath)) "resolved executable is absolute"
 Assert-True (Test-Path -LiteralPath $powershellPath) "resolved executable exists"
 
-$codexPath = Resolve-CodexCommandPath
-Assert-True ([IO.Path]::IsPathRooted($codexPath)) "Codex executable is absolute"
-Assert-True (Test-Path -LiteralPath $codexPath) "Codex executable exists"
-Assert-True ($codexPath -notmatch '\\WindowsApps\\') `
-    "Codex executable avoids protected WindowsApps paths"
+$sleepProcessInfo = New-Object Diagnostics.ProcessStartInfo
+$sleepProcessInfo.FileName = $powershellPath
+$sleepProcessInfo.Arguments = "-NoLogo -NoProfile -NonInteractive -Command Start-Sleep -Seconds 30"
+$sleepProcessInfo.UseShellExecute = $false
+$sleepProcessInfo.CreateNoWindow = $true
+$sleepProcess = [Diagnostics.Process]::Start($sleepProcessInfo)
+try {
+    Stop-QuotaWakeProcessTree -Process $sleepProcess
+    Assert-True $sleepProcess.HasExited `
+        "bounded probes terminate their process tree"
+}
+finally {
+    if (-not $sleepProcess.HasExited) {
+        $sleepProcess.Kill()
+        $sleepProcess.WaitForExit()
+    }
+    $sleepProcess.Dispose()
+}
+
+$codexFixtureRoot = Join-Path `
+    ([IO.Path]::GetTempPath()) `
+    "QuotaWake-Codex-$([Guid]::NewGuid().ToString('N'))"
+$previousCodexCliPath = $env:CODEX_CLI_PATH
+try {
+    [void](New-Item -ItemType Directory -Path $codexFixtureRoot -Force)
+    $expectedCodexPath = Join-Path $codexFixtureRoot "codex.exe"
+    [IO.File]::WriteAllText($expectedCodexPath, "")
+    $env:CODEX_CLI_PATH = $expectedCodexPath
+
+    $codexPath = Resolve-CodexCommandPath
+    Assert-Equal ([IO.Path]::GetFullPath($expectedCodexPath)) `
+        $codexPath `
+        "Codex path override resolves without requiring a real installation"
+}
+finally {
+    $env:CODEX_CLI_PATH = $previousCodexCliPath
+    if (Test-Path -LiteralPath $codexFixtureRoot) {
+        Remove-Item -LiteralPath $codexFixtureRoot -Recurse -Force
+    }
+}
 
 $defaultRoot = Get-DefaultInstallRoot
 Assert-True ([IO.Path]::IsPathRooted($defaultRoot)) "default install root is absolute"

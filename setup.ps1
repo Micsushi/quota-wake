@@ -52,6 +52,7 @@ if ($env:OS -ne "Windows_NT") {
 
 $modulePath = Join-Path $PSScriptRoot "src\QuotaWake.psm1"
 Import-Module $modulePath -Force -DisableNameChecking
+Assert-QuotaWakeTaskName -TaskName $TaskName
 $selectedAgents = @(Resolve-AgentSelection -Agents $Agents)
 $scheduleMode = "Continuous"
 $dailyRunTimes = @()
@@ -108,6 +109,45 @@ $stagingCodexInstructionsPath = Join-Path `
     $stagingRuntimeDirectory `
     "codex-instructions.txt"
 $stagingConfigPath = Join-Path $stagingRuntimeDirectory "config.json"
+$ownershipMarkerPath = Get-QuotaWakeOwnershipMarkerPath -InstallRoot $InstallRoot
+$taskArguments = Get-QuotaWakeScheduledTaskArguments `
+    -WorkerPath $installedWorkerPath `
+    -ConfigPath $configPath
+$existingTask = Get-ScheduledTask `
+    -TaskPath "\" `
+    -TaskName $TaskName `
+    -ErrorAction SilentlyContinue
+if (
+    $existingTask -and
+    -not (Test-QuotaWakeScheduledTaskOwnership `
+        -Task $existingTask `
+        -ExpectedExecute $powershellPath `
+        -ExpectedArguments $taskArguments)
+) {
+    throw "Task '$TaskName' already exists and is not owned by Quota Wake."
+}
+if (Test-Path -LiteralPath $ownershipMarkerPath -PathType Leaf) {
+    if (-not (Test-QuotaWakeInstallOwnership `
+        -InstallRoot $InstallRoot `
+        -TaskName $TaskName)) {
+        throw "Install root '$InstallRoot' has conflicting or invalid ownership."
+    }
+}
+elseif (Test-Path -LiteralPath $InstallRoot) {
+    $installRootItems = @(Get-ChildItem -LiteralPath $InstallRoot -Force)
+    if ($installRootItems.Count -gt 0 -and -not $existingTask) {
+        $legacyFiles = @(
+            $installedModulePath,
+            $installedWorkerPath,
+            $configPath
+        )
+        if (@($legacyFiles | Where-Object {
+            -not (Test-Path -LiteralPath $_ -PathType Leaf)
+        }).Count -gt 0) {
+            throw "Install root '$InstallRoot' contains unrelated data and has no ownership proof."
+        }
+    }
+}
 $prompt = (
     "Do not use tools, commands, files, network access, plugins, skills, " +
     "or external context. Perform no action other than replying with exactly: hi"
@@ -117,20 +157,12 @@ $codexInstructions = (
 )
 $config = [ordered]@{
     schemaVersion    = 3
-    taskName         = $TaskName
     agents           = $selectedAgents
     scheduleMode     = $scheduleMode
-    intervalHours    = $IntervalHours
     timeoutSeconds   = $TimeoutSeconds
     notificationsEnabled = $false
     workingDirectory = $stagingProbeDirectory
     stateDirectory   = $stagingStateDirectory
-}
-if ($scheduleMode -eq "Daily") {
-    $config["startTime"] = $parsedStartTime.ToString("hh\:mm")
-    $config["dailyRunTimes"] = @($dailyRunTimes | ForEach-Object {
-        $_.ToString("hh\:mm")
-    })
 }
 if ($selectedAgents -contains "Claude") {
     $config["claude"] = [ordered]@{
@@ -224,6 +256,14 @@ try {
     Write-AtomicUtf8File `
         -Path $configPath `
         -Content ($config | ConvertTo-Json -Depth 5)
+    Write-AtomicUtf8File `
+        -Path $ownershipMarkerPath `
+        -Content ([ordered]@{
+            product       = "QuotaWake"
+            schemaVersion = 1
+            installRoot   = $InstallRoot
+            taskName      = $TaskName
+        } | ConvertTo-Json)
 }
 finally {
     if (Test-Path -LiteralPath $stagingRoot) {
@@ -247,22 +287,9 @@ else {
         -RepetitionDuration (New-TimeSpan -Days 3650)
 }
 
-$taskArguments = @(
-    "-NoLogo",
-    "-NoProfile",
-    "-NonInteractive",
-    "-WindowStyle",
-    "Hidden",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-File",
-    $installedWorkerPath,
-    "-ConfigPath",
-    $configPath
-)
 $action = New-ScheduledTaskAction `
     -Execute $powershellPath `
-    -Argument (Join-CommandLineArguments -ArgumentList $taskArguments)
+    -Argument $taskArguments
 $principal = New-ScheduledTaskPrincipal `
     -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
     -LogonType Interactive `
@@ -274,16 +301,34 @@ $settings = New-ScheduledTaskSettingsSet `
     -DontStopIfGoingOnBatteries `
     -WakeToRun
 
-Register-ScheduledTask `
+$taskBeforeRegister = Get-ScheduledTask `
+    -TaskPath "\" `
     -TaskName $TaskName `
-    -Description "Starts minimal $($selectedAgents -join ' and ') usage-window calls." `
-    -Action $action `
-    -Trigger $triggers `
-    -Principal $principal `
-    -Settings $settings `
-    -Force | Out-Null
+    -ErrorAction SilentlyContinue
+if (
+    $taskBeforeRegister -and
+    -not (Test-QuotaWakeScheduledTaskOwnership `
+        -Task $taskBeforeRegister `
+        -ExpectedExecute $powershellPath `
+        -ExpectedArguments $taskArguments)
+) {
+    throw "Task '$TaskName' changed during setup and is not owned by Quota Wake."
+}
+$registrationParameters = @{
+    TaskPath   = "\"
+    TaskName   = $TaskName
+    Description = "Starts minimal $($selectedAgents -join ' and ') usage-window calls."
+    Action     = $action
+    Trigger    = $triggers
+    Principal  = $principal
+    Settings   = $settings
+}
+if ($taskBeforeRegister) {
+    $registrationParameters["Force"] = $true
+}
+Register-ScheduledTask @registrationParameters | Out-Null
 
-$taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName
+$taskInfo = Get-ScheduledTaskInfo -TaskPath "\" -TaskName $TaskName
 [pscustomobject]@{
     Installed      = $true
     TaskName       = $TaskName
