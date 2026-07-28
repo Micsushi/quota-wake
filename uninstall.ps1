@@ -16,12 +16,17 @@ $InstallRoot = [IO.Path]::GetFullPath($InstallRoot)
 
 $runtimeDirectory = Join-Path $InstallRoot "runtime"
 $workerPath = Join-Path $runtimeDirectory "run-quota-wake.ps1"
+$launcherPath = Join-Path $runtimeDirectory "run-hidden.vbs"
 $configPath = Join-Path $runtimeDirectory "config.json"
 $powershellPath = Resolve-CommandPath "powershell.exe"
 $expectedArguments = Get-QuotaWakeScheduledTaskArguments `
     -WorkerPath $workerPath `
     -ConfigPath $configPath `
     -SuppressNotifications:($TaskName -like "QuotaWake-Test-*")
+$expectedAction = Get-QuotaWakeScheduledTaskAction `
+    -LauncherPath $launcherPath `
+    -PowerShellPath $powershellPath `
+    -WorkerArguments $expectedArguments
 
 if (
     $RemoveData -and
@@ -40,8 +45,8 @@ $task = Get-ScheduledTask `
 if ($task) {
     if (-not (Test-QuotaWakeScheduledTaskOwnership `
         -Task $task `
-        -ExpectedExecute $powershellPath `
-        -ExpectedArguments $expectedArguments)) {
+        -ExpectedExecute $expectedAction.Execute `
+        -ExpectedArguments $expectedAction.Arguments)) {
         throw "Refusing to remove task '$TaskName' because it is not owned by Quota Wake."
     }
     if ($task.State -eq "Running") {

@@ -16,11 +16,16 @@ $InstallRoot = [IO.Path]::GetFullPath($InstallRoot)
 $runtimeDirectory = Join-Path $InstallRoot "runtime"
 $configPath = Join-Path $runtimeDirectory "config.json"
 $workerPath = Join-Path $runtimeDirectory "run-quota-wake.ps1"
+$launcherPath = Join-Path $runtimeDirectory "run-hidden.vbs"
 $powershellPath = Resolve-CommandPath "powershell.exe"
 $expectedArguments = Get-QuotaWakeScheduledTaskArguments `
     -WorkerPath $workerPath `
     -ConfigPath $configPath `
     -SuppressNotifications:($TaskName -like "QuotaWake-Test-*")
+$expectedAction = Get-QuotaWakeScheduledTaskAction `
+    -LauncherPath $launcherPath `
+    -PowerShellPath $powershellPath `
+    -WorkerArguments $expectedArguments
 $task = Get-ScheduledTask `
     -TaskPath "\" `
     -TaskName $TaskName `
@@ -29,8 +34,8 @@ $taskOwned = $false
 if ($task) {
     $taskOwned = Test-QuotaWakeScheduledTaskOwnership `
         -Task $task `
-        -ExpectedExecute $powershellPath `
-        -ExpectedArguments $expectedArguments
+        -ExpectedExecute $expectedAction.Execute `
+        -ExpectedArguments $expectedAction.Arguments
 }
 
 $agents = @()

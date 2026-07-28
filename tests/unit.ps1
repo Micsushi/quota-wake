@@ -166,6 +166,16 @@ $expectedTaskArguments = Get-QuotaWakeScheduledTaskArguments `
     -ConfigPath "C:\Quota Wake\runtime\config.json"
 Assert-True ($expectedTaskArguments -match '-WindowStyle Hidden') `
     "scheduled task arguments keep the worker hidden"
+$expectedTaskAction = Get-QuotaWakeScheduledTaskAction `
+    -LauncherPath "C:\Quota Wake\runtime\run-hidden.vbs" `
+    -PowerShellPath "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" `
+    -WorkerArguments $expectedTaskArguments
+Assert-True ($expectedTaskAction.Execute -match 'wscript\.exe$') `
+    "scheduled task starts from a windowless host"
+Assert-True ($expectedTaskAction.Arguments -match 'run-hidden\.vbs') `
+    "scheduled task routes through the hidden launcher"
+Assert-True ($expectedTaskAction.Arguments -match 'powershell\.exe') `
+    "hidden launcher starts the PowerShell worker"
 Assert-True ($expectedTaskArguments -notmatch '-SuppressNotifications') `
     "production task arguments retain failure notifications"
 $testTaskArguments = Get-QuotaWakeScheduledTaskArguments `
@@ -213,7 +223,12 @@ $ownershipRoot = Join-Path `
 try {
     $ownershipRuntime = Join-Path $ownershipRoot "runtime"
     [void](New-Item -ItemType Directory -Path $ownershipRuntime -Force)
-    foreach ($name in @("config.json", "QuotaWake.psm1", "run-quota-wake.ps1")) {
+    foreach ($name in @(
+        "config.json",
+        "QuotaWake.psm1",
+        "run-hidden.vbs",
+        "run-quota-wake.ps1"
+    )) {
         [IO.File]::WriteAllText((Join-Path $ownershipRuntime $name), "")
     }
     $ownershipMarkerPath = Get-QuotaWakeOwnershipMarkerPath `

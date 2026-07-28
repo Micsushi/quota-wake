@@ -305,9 +305,11 @@ try {
         "daily triggers reset at the configured start time"
 
     $action = $tasks[0].Actions[0]
+    Assert-True ($action.Execute -match "wscript\.exe$") "task starts from a windowless host"
+    Assert-True ($action.Arguments -match "run-hidden\.vbs") "task uses the hidden launcher"
     Assert-True ($action.Arguments -match "-NoProfile") "task skips profiles"
     Assert-True ($action.Arguments -match "-NonInteractive") "task is noninteractive"
-    Assert-True ($action.Arguments -match "-WindowStyle Hidden") "task is hidden"
+    Assert-True ($action.Arguments -match "-WindowStyle") "task retains hidden worker options"
     Assert-True ($action.Arguments -match [regex]::Escape($installRoot)) `
         "task supports install paths with spaces"
     Assert-True ($action.Arguments -match "-SuppressNotifications") `

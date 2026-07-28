@@ -87,6 +87,33 @@ function Get-QuotaWakeScheduledTaskArguments {
     return Join-CommandLineArguments -ArgumentList $arguments
 }
 
+function Get-QuotaWakeScheduledTaskAction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LauncherPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PowerShellPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$WorkerArguments,
+
+        [string]$WScriptPath = (Join-Path $env:SystemRoot "System32\wscript.exe")
+    )
+
+    $prefix = Join-CommandLineArguments -ArgumentList @(
+        "//B",
+        "//Nologo",
+        $LauncherPath,
+        $PowerShellPath
+    )
+    return [pscustomobject]@{
+        Execute   = $WScriptPath
+        Arguments = "$prefix $WorkerArguments"
+    }
+}
+
 function Assert-QuotaWakeTaskName {
     [CmdletBinding()]
     param(
@@ -196,7 +223,9 @@ function Test-QuotaWakeInstallOwnership {
         [string]$InstallRoot,
 
         [Parameter(Mandatory = $true)]
-        [string]$TaskName
+        [string]$TaskName,
+
+        [switch]$AllowLegacyLauncherMissing
     )
 
     $resolvedInstallRoot = [IO.Path]::GetFullPath($InstallRoot)
@@ -231,7 +260,15 @@ function Test-QuotaWakeInstallOwnership {
         }
 
         $runtimeDirectory = Join-Path $resolvedInstallRoot "runtime"
-        foreach ($name in @("config.json", "QuotaWake.psm1", "run-quota-wake.ps1")) {
+        $requiredFiles = @(
+            "config.json",
+            "QuotaWake.psm1",
+            "run-quota-wake.ps1"
+        )
+        if (-not $AllowLegacyLauncherMissing) {
+            $requiredFiles += "run-hidden.vbs"
+        }
+        foreach ($name in $requiredFiles) {
             if (-not (Test-Path -LiteralPath (Join-Path $runtimeDirectory $name) -PathType Leaf)) {
                 return $false
             }
@@ -1608,6 +1645,7 @@ Export-ModuleMember -Function @(
     "Quote-CommandLineArgument",
     "Join-CommandLineArguments",
     "Get-QuotaWakeScheduledTaskArguments",
+    "Get-QuotaWakeScheduledTaskAction",
     "Assert-QuotaWakeTaskName",
     "Test-QuotaWakeScheduledTaskOwnership",
     "Resolve-CommandPath",
