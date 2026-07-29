@@ -158,6 +158,18 @@ try {
             -File (Join-Path $installRoot "runtime\run-quota-wake.ps1") `
             -ConfigPath $configPath `
             -SuppressNotifications
+        if ($LASTEXITCODE -ne 0) {
+            $singleFailurePath = Join-Path `
+                $installRoot `
+                "state\last-result.json"
+            $singleFailure = if (Test-Path -LiteralPath $singleFailurePath) {
+                Get-Content -LiteralPath $singleFailurePath -Raw
+            }
+            else {
+                "last-result.json was not written"
+            }
+            throw "Single-agent worker failed: $singleFailure"
+        }
         Assert-True ($LASTEXITCODE -eq 0) "single-agent worker exits zero"
         Assert-True (($singleOutput -join "`n").Trim() -ceq "hi") `
             "single-agent worker returns exact hi"

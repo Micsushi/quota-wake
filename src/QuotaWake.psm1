@@ -426,6 +426,28 @@ function Get-AgentFailureGuidance {
     )
 }
 
+function Resolve-AgentProcessPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Claude", "Codex")]
+        [string]$Agent,
+
+        [string]$ConfiguredPath
+    )
+
+    if (
+        -not [string]::IsNullOrWhiteSpace($ConfiguredPath) -and
+        (Test-Path -LiteralPath $ConfiguredPath -PathType Leaf)
+    ) {
+        return [IO.Path]::GetFullPath($ConfiguredPath)
+    }
+    if ($Agent -eq "Codex") {
+        return Resolve-CodexCommandPath
+    }
+    return Resolve-CommandPath "claude.exe"
+}
+
 function Get-AgentProcessSpecifications {
     [CmdletBinding()]
     param(
@@ -1657,6 +1679,7 @@ Export-ModuleMember -Function @(
     "Get-AgentSetupHelp",
     "Resolve-AgentSelection",
     "Get-AgentFailureGuidance",
+    "Resolve-AgentProcessPath",
     "Get-AgentProcessSpecifications",
     "Start-HiddenProcess",
     "Stop-QuotaWakeProcessTree",

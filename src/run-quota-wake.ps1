@@ -248,14 +248,30 @@ try {
         -Config $config `
         -WorkingDirectory $runDirectory)
     foreach ($specification in $specifications) {
-        $handles += Start-HiddenProcess `
-            -Name $specification.Name `
-            -FilePath $specification.FilePath `
-            -ArgumentList $specification.ArgumentList `
-            -WorkingDirectory $specification.WorkingDirectory `
-            -EnvironmentVariables $specification.EnvironmentVariables `
-            -OutputFormat $specification.OutputFormat `
-            -Model $specification.Model
+        try {
+            $processPath = Resolve-AgentProcessPath `
+                -Agent $specification.Name `
+                -ConfiguredPath $specification.FilePath
+            $handles += Start-HiddenProcess `
+                -Name $specification.Name `
+                -FilePath $processPath `
+                -ArgumentList $specification.ArgumentList `
+                -WorkingDirectory $specification.WorkingDirectory `
+                -EnvironmentVariables $specification.EnvironmentVariables `
+                -OutputFormat $specification.OutputFormat `
+                -Model $specification.Model
+        }
+        catch {
+            $results[$specification.Name] = [pscustomobject]@{
+                name = $specification.Name
+                success = $false
+                exitCode = $null
+                error = (
+                    "$($specification.Name) failed to start: " +
+                    $_.Exception.Message
+                )
+            }
+        }
     }
 
     foreach ($handle in $handles) {

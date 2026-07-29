@@ -479,6 +479,33 @@ try {
     Assert-Equal ([IO.Path]::GetFullPath($expectedCodexPath)) `
         $codexPath `
         "Codex path override resolves without requiring a real installation"
+
+    $recoveredCodexPath = Resolve-AgentProcessPath `
+        -Agent "Codex" `
+        -ConfiguredPath (
+            Join-Path $codexFixtureRoot "removed-version\codex.exe"
+        )
+    Assert-Equal ([IO.Path]::GetFullPath($expectedCodexPath)) `
+        $recoveredCodexPath `
+        "Codex runtime recovers when a desktop update removes the configured binary"
+
+    $expectedClaudePath = Join-Path $codexFixtureRoot "claude.exe"
+    [IO.File]::WriteAllText($expectedClaudePath, "")
+    $previousPath = $env:PATH
+    try {
+        $env:PATH = "$codexFixtureRoot;$previousPath"
+        $recoveredClaudePath = Resolve-AgentProcessPath `
+            -Agent "Claude" `
+            -ConfiguredPath (
+                Join-Path $codexFixtureRoot "removed-version\claude.exe"
+            )
+        Assert-Equal ([IO.Path]::GetFullPath($expectedClaudePath)) `
+            $recoveredClaudePath `
+            "Claude runtime recovers when an update moves the configured binary"
+    }
+    finally {
+        $env:PATH = $previousPath
+    }
 }
 finally {
     $env:CODEX_CLI_PATH = $previousCodexCliPath

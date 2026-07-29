@@ -154,6 +154,80 @@ try {
             -LiteralPath (Join-Path $persistenceProbe "old-residue.txt") `
             -PathType Leaf
     ) "worker does not delete unrelated probe-root residue"
+
+    $partialStartupRoot = Join-Path $testRoot "partial-startup-case"
+    $partialStartupRuntime = Join-Path $partialStartupRoot "runtime"
+    $partialStartupState = Join-Path $partialStartupRoot "state"
+    $partialStartupProbe = Join-Path $partialStartupRoot "probe"
+    [void](New-Item -ItemType Directory -Path $partialStartupRuntime -Force)
+    [void](New-Item -ItemType Directory -Path $partialStartupState -Force)
+    [void](New-Item -ItemType Directory -Path $partialStartupProbe -Force)
+    $partialStartupInstructions = Join-Path `
+        $partialStartupRuntime `
+        "codex-instructions.txt"
+    [IO.File]::WriteAllText($partialStartupInstructions, "Reply with exactly: hi")
+    $partialStartupConfigPath = Join-Path `
+        $partialStartupRuntime `
+        "config.json"
+    [IO.File]::WriteAllText(
+        $partialStartupConfigPath,
+        ([ordered]@{
+            schemaVersion = 3
+            agents = @("Claude", "Codex")
+            timeoutSeconds = 10
+            notificationsEnabled = $false
+            workingDirectory = $partialStartupProbe
+            stateDirectory = $partialStartupState
+            claude = [ordered]@{
+                path = $partialStartupInstructions
+                model = "haiku"
+                prompt = "Reply with exactly: hi"
+            }
+            codex = [ordered]@{
+                path = Join-Path $env:SystemRoot "System32\where.exe"
+                model = "gpt-test-mini"
+                prompt = "Reply with exactly: hi"
+                instructionsPath = $partialStartupInstructions
+            }
+        } | ConvertTo-Json -Depth 5)
+    )
+
+    $previousCodexCliPath = $env:CODEX_CLI_PATH
+    try {
+        $env:CODEX_CLI_PATH = Join-Path `
+            $partialStartupRoot `
+            "also-missing-codex.exe"
+        $previousErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $output = & powershell.exe `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -ExecutionPolicy Bypass `
+            -File (Join-Path $repoRoot "src\run-quota-wake.ps1") `
+            -ConfigPath $partialStartupConfigPath `
+            -SuppressNotifications 2>&1
+        $partialStartupExitCode = $LASTEXITCODE
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    finally {
+        $env:CODEX_CLI_PATH = $previousCodexCliPath
+    }
+
+    Assert-True ($partialStartupExitCode -ne 0) `
+        "one failed agent startup exits nonzero"
+    $partialStartupResult = Get-Content `
+        -LiteralPath (Join-Path $partialStartupState "last-result.json") `
+        -Raw | ConvertFrom-Json
+    Assert-True ($null -ne $partialStartupResult.results.codex.exitCode) `
+        "Codex retains its own completed process result"
+    Assert-True (
+        $partialStartupResult.results.claude.error -match "Claude.*start"
+    ) "Claude alone reports its startup failure"
+    Assert-True (
+        $partialStartupResult.results.codex.error -notmatch
+            "configuration or startup"
+    ) "Claude startup failure is not copied onto Codex"
 }
 finally {
     if (Test-Path -LiteralPath $testRoot) {
