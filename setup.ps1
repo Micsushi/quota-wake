@@ -196,6 +196,7 @@ elseif (Test-Path -LiteralPath $InstallRoot) {
 
 $timeZoneId = [TimeZoneInfo]::Local.Id
 $localTimeZone = [TimeZoneInfo]::FindSystemTimeZoneById($timeZoneId)
+$existingConfig = $null
 $existingSchedule = $null
 if (Test-Path -LiteralPath $configPath -PathType Leaf) {
     try {
@@ -235,6 +236,20 @@ if (Test-Path -LiteralPath $configPath -PathType Leaf) {
     catch {
         $existingSchedule = $null
     }
+}
+
+if (
+    -not $PSBoundParameters.ContainsKey("ClaudeConfigDir") -and
+    $existingConfig -and
+    $existingConfig.PSObject.Properties["claude"] -and
+    $existingConfig.claude.PSObject.Properties["configDir"] -and
+    -not [string]::IsNullOrWhiteSpace(
+        [string]$existingConfig.claude.configDir
+    )
+) {
+    $ClaudeConfigDir = [IO.Path]::GetFullPath(
+        [string]$existingConfig.claude.configDir
+    )
 }
 
 if ($existingSchedule) {

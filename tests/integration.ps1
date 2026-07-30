@@ -113,6 +113,15 @@ try {
     Assert-True (
         $singleAgentConfig.claude.configDir -eq $ClaudeConfigDir
     ) "setup stores the isolated Claude credential directory"
+    & (Join-Path $repoRoot "setup.ps1") `
+        -Agents Claude `
+        -TaskName $taskName `
+        -InstallRoot $installRoot `
+        -SkipLiveTest | Out-Null
+    $rerunConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    Assert-True (
+        $rerunConfig.claude.configDir -eq $ClaudeConfigDir
+    ) "setup rerun preserves the isolated Claude credential directory"
     $continuousTask = Get-ScheduledTask -TaskName $taskName
     $continuousInfo = Get-ScheduledTaskInfo -TaskName $taskName
     Assert-True ($continuousTask.Triggers.Count -eq 1) `
