@@ -1,5 +1,10 @@
 .vscode/
 .idea/
+.agents/
+.claude/
+.codex/
+.gemini/
+docs/superpowers/
 *.log
 *.tmp
 config.json
