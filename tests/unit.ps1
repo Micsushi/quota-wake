@@ -151,6 +151,29 @@ $guidance = Get-AgentFailureGuidance `
 Assert-True ($guidance -match "sign in") "failure guidance mentions authentication"
 Assert-True ($guidance -match "rerun") "failure guidance explains the next step"
 
+$failureJson = '{"is_error":true,"result":"Failed to authenticate: OAuth session expired and could not be refreshed","type":"result"}'
+$shellPath = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+if (-not $shellPath) {
+    $shellPath = (Get-Command powershell -ErrorAction Stop).Source
+}
+$failureHandle = Start-HiddenProcess `
+    -Name "Claude" `
+    -FilePath $shellPath `
+    -ArgumentList @(
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "[Console]::Out.Write('$failureJson'); exit 1"
+    ) `
+    -WorkingDirectory $repoRoot `
+    -OutputFormat "ClaudeJson"
+$failureResult = Complete-HiddenProcess `
+    -Handle $failureHandle `
+    -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(5))
+Assert-True ($failureResult.error -match "OAuth session expired") `
+    "structured Claude auth failures preserve the provider reason"
+
 $notificationsDisabled = [pscustomobject]@{ notificationsEnabled = $false }
 $notificationsEnabled = [pscustomobject]@{ notificationsEnabled = $true }
 $legacyNotificationConfig = [pscustomobject]@{}

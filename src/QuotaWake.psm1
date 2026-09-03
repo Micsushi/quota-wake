@@ -657,6 +657,44 @@ function Stop-QuotaWakeProcessTree {
     }
 }
 
+function Get-HiddenProcessFailureDetail {
+    [CmdletBinding()]
+    param(
+        [string]$Output,
+        [string]$ErrorOutput
+    )
+
+    if ($Output) {
+        try {
+            $data = $Output | ConvertFrom-Json
+            foreach ($name in @("result", "error", "message")) {
+                $property = $data.PSObject.Properties[$name]
+                if ($property -and $property.Value -is [string]) {
+                    $detail = ([string]$property.Value).Trim()
+                    if ($detail) {
+                        return $detail
+                    }
+                }
+            }
+        }
+        catch {
+        }
+    }
+
+    if (-not $ErrorOutput) {
+        return $null
+    }
+
+    $detail = ($ErrorOutput -replace "\s+", " ").Trim()
+    $detail = $detail -replace `
+        "(?i)\b(bearer|token|api[_ -]?key)\s*[:=]\s*\S+", `
+        '$1=[redacted]'
+    if ($detail.Length -gt 240) {
+        return $detail.Substring(0, 240) + "..."
+    }
+    return $detail
+}
+
 function Complete-HiddenProcess {
     [CmdletBinding()]
     param(
@@ -688,13 +726,20 @@ function Complete-HiddenProcess {
         }
 
         $stdout = $Handle.StdoutTask.GetAwaiter().GetResult()
-        [void]$Handle.StderrTask.GetAwaiter().GetResult()
+        $stderr = $Handle.StderrTask.GetAwaiter().GetResult()
         if ($process.ExitCode -ne 0) {
+            $errorMessage = "$($Handle.Name) exited with code $($process.ExitCode)."
+            $detail = Get-HiddenProcessFailureDetail `
+                -Output $stdout `
+                -ErrorOutput $stderr
+            if ($detail) {
+                $errorMessage += " $detail"
+            }
             return [pscustomobject]@{
                 name     = $Handle.Name
                 success  = $false
                 exitCode = $process.ExitCode
-                error    = "$($Handle.Name) exited with code $($process.ExitCode)."
+                error    = $errorMessage
             }
         }
         try {
