@@ -504,8 +504,12 @@ $principal = New-ScheduledTaskPrincipal `
     -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
     -LogonType Interactive `
     -RunLevel Limited
+# Agents are probed sequentially and each may burn the full per-agent timeout,
+# so the task's own limit has to cover all of them. Sizing it for a single
+# agent let Task Scheduler kill a two-agent run before it could record why.
+$executionTimeLimitSeconds = ($TimeoutSeconds * [Math]::Max(1, $selectedAgents.Count)) + 60
 $settings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit (New-TimeSpan -Seconds ($TimeoutSeconds + 30)) `
+    -ExecutionTimeLimit (New-TimeSpan -Seconds $executionTimeLimitSeconds) `
     -MultipleInstances IgnoreNew `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
