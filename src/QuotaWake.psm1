@@ -448,6 +448,27 @@ function Resolve-AgentProcessPath {
     return Resolve-CommandPath "claude.exe"
 }
 
+# Setup freezes the resolved executable path into config.json, but both CLIs
+# install into a version-hashed directory and delete the old one when they
+# update themselves. The pinned path then points at nothing and every probe
+# fails until setup is re-run. Re-resolve whenever the recorded path is gone.
+function Resolve-InstalledAgentPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Claude", "Codex")]
+        [string]$Agent,
+
+        [string]$ConfiguredPath
+    )
+
+    if ($ConfiguredPath -and (Test-Path -LiteralPath $ConfiguredPath -PathType Leaf)) {
+        return $ConfiguredPath
+    }
+
+    return Resolve-AgentProcessPath -Agent $Agent
+}
+
 function Get-AgentProcessSpecifications {
     [CmdletBinding()]
     param(
@@ -477,7 +498,9 @@ function Get-AgentProcessSpecifications {
             }
             [pscustomobject]@{
                 Name         = "Claude"
-                FilePath     = [string]$Config.claude.path
+                FilePath     = Resolve-InstalledAgentPath `
+                    -Agent "Claude" `
+                    -ConfiguredPath ([string]$Config.claude.path)
                 Model        = [string]$Config.claude.model
                 WorkingDirectory = $WorkingDirectory
                 OutputFormat = "ClaudeJson"
@@ -509,7 +532,9 @@ function Get-AgentProcessSpecifications {
 
         [pscustomobject]@{
             Name         = "Codex"
-            FilePath     = [string]$Config.codex.path
+            FilePath     = Resolve-InstalledAgentPath `
+                -Agent "Codex" `
+                -ConfiguredPath ([string]$Config.codex.path)
             Model        = [string]$Config.codex.model
             WorkingDirectory = $WorkingDirectory
             OutputFormat = "CodexJson"
@@ -657,6 +682,66 @@ function Stop-QuotaWakeProcessTree {
     }
 }
 
+# Scans a JSONL stream for the last reported error. Codex nests it as
+# {"error":{"message":...}} on turn.failed and as {"type":"error","message":...}
+# on stream errors, and wraps item-level errors in {"item":{...}}.
+# The module runs under StrictMode, so every hop is probed before it is read.
+function Get-JsonLinesFailureDetail {
+    [CmdletBinding()]
+    param([string]$Output)
+
+    function Get-Member-Value {
+        param($InputObject, [string]$Name)
+
+        if ($null -eq $InputObject) {
+            return $null
+        }
+        $property = $InputObject.PSObject.Properties[$Name]
+        if (-not $property) {
+            return $null
+        }
+        return $property.Value
+    }
+
+    $detail = $null
+    foreach ($line in ($Output -split "`r?`n")) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed.StartsWith("{")) {
+            continue
+        }
+
+        try {
+            $entry = $trimmed | ConvertFrom-Json
+        }
+        catch {
+            continue
+        }
+
+        $item = Get-Member-Value -InputObject $entry -Name "item"
+        $candidates = @(
+            (Get-Member-Value -InputObject (Get-Member-Value -InputObject $entry -Name "error") -Name "message"),
+            (Get-Member-Value -InputObject (Get-Member-Value -InputObject $item -Name "error") -Name "message")
+        )
+        if ((Get-Member-Value -InputObject $entry -Name "type") -eq "error") {
+            $candidates += (Get-Member-Value -InputObject $entry -Name "message")
+        }
+        if ((Get-Member-Value -InputObject $item -Name "type") -eq "error") {
+            $candidates += (Get-Member-Value -InputObject $item -Name "message")
+        }
+
+        foreach ($candidate in $candidates) {
+            if ($candidate -is [string]) {
+                $text = ([string]$candidate).Trim()
+                if ($text) {
+                    $detail = $text
+                }
+            }
+        }
+    }
+
+    return $detail
+}
+
 function Get-HiddenProcessFailureDetail {
     [CmdletBinding()]
     param(
@@ -678,6 +763,15 @@ function Get-HiddenProcessFailureDetail {
             }
         }
         catch {
+        }
+
+        # Codex --json emits JSONL, so the whole stream is not one object. The
+        # real reason ("You've hit your usage limit") lives in a later line,
+        # while stderr only carries the "Reading additional input from stdin..."
+        # notice - which was being reported as the failure for every run.
+        $detail = Get-JsonLinesFailureDetail -Output $Output
+        if ($detail) {
+            return $detail
         }
     }
 
@@ -1716,6 +1810,8 @@ Export-ModuleMember -Function @(
     "Assert-QuotaWakeTaskName",
     "Test-QuotaWakeScheduledTaskOwnership",
     "Resolve-CommandPath",
+    "Resolve-InstalledAgentPath",
+    "Get-JsonLinesFailureDetail",
     "Resolve-CodexCommandPath",
     "Get-DefaultInstallRoot",
     "Get-QuotaWakeOwnershipMarkerPath",

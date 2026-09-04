@@ -28,10 +28,15 @@ tokens with Claude Code in VS Code:
 ```powershell
 $profile = "$env:LOCALAPPDATA\QuotaWake\claude-profile"
 $env:CLAUDE_CONFIG_DIR = $profile
-claude auth login
+claude   # then sign in with /login inside the session
 .\setup.ps1 -Agents Claude,Codex -ClaudeConfigDir $profile
 Remove-Item Env:\CLAUDE_CONFIG_DIR
 ```
+
+The isolated profile's OAuth refresh token expires on its own schedule (about
+12 days observed). Scheduled probes refresh the access token but do not extend
+that window, so this login has to be repeated when Claude probes start failing
+with `OAuth session expired and could not be refreshed`.
 
 This can use the same Claude account, but the second login creates a separate
 OAuth token pair. Setup stores only the profile path and injects
