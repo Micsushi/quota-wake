@@ -279,6 +279,26 @@ try {
             -Handle $handle `
             -DeadlineUtc $deadlineUtc
     }
+
+    # The isolated Claude profile's login expires on a fixed window that
+    # scheduled probes never extend. Rather than going dark until someone
+    # notices, fall back to the token Claude Code maintains for its own default
+    # profile - read-only, never refreshed, so it cannot sign Claude Code out.
+    if ($results.ContainsKey("Claude") -and (Test-ClaudeAuthFailure -Result $results["Claude"])) {
+        $primaryError = [string](Get-JsonPropertyValue -InputObject $results["Claude"] -Name "error")
+        $fallback = Invoke-ClaudeReadOnlyProbe -TimeoutSeconds ([int]$config.timeoutSeconds)
+        $fallbackError = [string](Get-JsonPropertyValue -InputObject $fallback -Name "error")
+        if ([bool](Get-JsonPropertyValue -InputObject $fallback -Name "success")) {
+            $fallback | Add-Member -NotePropertyName primaryError -NotePropertyValue $primaryError -Force
+            $results["Claude"] = $fallback
+        }
+        else {
+            $results["Claude"] | Add-Member `
+                -NotePropertyName error `
+                -NotePropertyValue "$primaryError | read-only fallback: $fallbackError" `
+                -Force
+        }
+    }
 }
 catch {
     $startupError = "Worker configuration or startup failed: $($_.Exception.Message)"

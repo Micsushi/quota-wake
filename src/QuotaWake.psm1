@@ -686,6 +686,259 @@ function Stop-QuotaWakeProcessTree {
 # {"error":{"message":...}} on turn.failed and as {"type":"error","message":...}
 # on stream errors, and wraps item-level errors in {"item":{...}}.
 # The module runs under StrictMode, so every hop is probed before it is read.
+# Claude's isolated profile keeps its own OAuth pair, but the refresh token
+# behind it expires on a fixed window (~12 days observed) that scheduled probes
+# refresh the access token against without ever extending. When that window
+# closes the profile is signed out until someone logs in interactively.
+#
+# These helpers provide the two things that keep the probe useful anyway: a
+# warning raised before the window closes, and a read-only fallback that pokes
+# the API with the token Claude Code maintains for its own default profile.
+# The fallback never writes, refreshes, or rotates anything - rotating a shared
+# refresh token is what signs Claude Code out.
+
+# ConvertFrom-Json objects lack absent properties entirely, and the module runs
+# under StrictMode, so every read has to be guarded.
+function Get-JsonPropertyValue {
+    [CmdletBinding()]
+    param($InputObject, [string]$Name)
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+    $property = $InputObject.PSObject.Properties[$Name]
+    if (-not $property) {
+        return $null
+    }
+    return $property.Value
+}
+
+function Get-ClaudeCredentialsPath {
+    [CmdletBinding()]
+    param([string]$ConfigDir)
+
+    if ($ConfigDir) {
+        return (Join-Path $ConfigDir ".credentials.json")
+    }
+    $userProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+    if (-not $userProfile) {
+        return $null
+    }
+    return (Join-Path $userProfile ".claude\.credentials.json")
+}
+
+function Read-ClaudeOauthCredentials {
+    [CmdletBinding()]
+    param([string]$Path)
+
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        $parsed = $raw | ConvertFrom-Json
+    }
+    catch {
+        return $null
+    }
+    return (Get-JsonPropertyValue -InputObject $parsed -Name "claudeAiOauth")
+}
+
+function Get-EpochMilliseconds {
+    [CmdletBinding()]
+    param($Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+    [long]$parsed = 0
+    if (-not [long]::TryParse([string]$Value, [ref]$parsed) -or $parsed -le 0) {
+        return $null
+    }
+    return [DateTimeOffset]::FromUnixTimeMilliseconds($parsed).UtcDateTime
+}
+
+# Returns the default profile's access token only while it is still valid.
+# A cold token is reported as absent: onWatch-style read-only use cannot renew
+# it, and sending a dead token just earns a 401.
+function Get-ClaudeReadOnlyToken {
+    [CmdletBinding()]
+    param(
+        [string]$CredentialsPath,
+        [DateTime]$UtcNow = [DateTime]::UtcNow
+    )
+
+    if (-not $CredentialsPath) {
+        $CredentialsPath = Get-ClaudeCredentialsPath
+    }
+    $oauth = Read-ClaudeOauthCredentials -Path $CredentialsPath
+    if (-not $oauth) {
+        return $null
+    }
+    $token = [string](Get-JsonPropertyValue -InputObject $oauth -Name "accessToken")
+    if (-not $token.Trim()) {
+        return $null
+    }
+    $expiresAt = Get-EpochMilliseconds -Value (
+        Get-JsonPropertyValue -InputObject $oauth -Name "expiresAt")
+    # An unrecorded expiry makes no claim to be expired.
+    if ($expiresAt -and $expiresAt -le $UtcNow) {
+        return $null
+    }
+    return $token.Trim()
+}
+
+# Reports how long the isolated profile's login has left, so the caller can warn
+# before it closes instead of discovering it days later.
+function Get-ClaudeLoginExpiryWarning {
+    [CmdletBinding()]
+    param(
+        [string]$ConfigDir,
+        [int]$WarnWithinHours = 72,
+        [DateTime]$UtcNow = [DateTime]::UtcNow
+    )
+
+    if (-not $ConfigDir) {
+        return $null
+    }
+    $oauth = Read-ClaudeOauthCredentials -Path (Get-ClaudeCredentialsPath -ConfigDir $ConfigDir)
+    if (-not $oauth) {
+        return "The isolated Claude profile at $ConfigDir is signed out. Run 'claude' with CLAUDE_CONFIG_DIR set to it and sign in with /login."
+    }
+    $token = [string](Get-JsonPropertyValue -InputObject $oauth -Name "accessToken")
+    if (-not $token.Trim()) {
+        return "The isolated Claude profile at $ConfigDir is signed out. Run 'claude' with CLAUDE_CONFIG_DIR set to it and sign in with /login."
+    }
+    $refreshExpiry = Get-EpochMilliseconds -Value (
+        Get-JsonPropertyValue -InputObject $oauth -Name "refreshTokenExpiresAt")
+    if (-not $refreshExpiry) {
+        return $null
+    }
+    $remaining = $refreshExpiry - $UtcNow
+    if ($remaining.TotalHours -gt $WarnWithinHours) {
+        return $null
+    }
+    if ($remaining.TotalSeconds -le 0) {
+        return "The isolated Claude profile login at $ConfigDir has expired. Run 'claude' with CLAUDE_CONFIG_DIR set to it and sign in with /login."
+    }
+    $when = if ($remaining.TotalHours -lt 48) {
+        "{0:N0} hours" -f $remaining.TotalHours
+    }
+    else {
+        "{0:N0} days" -f $remaining.TotalDays
+    }
+    return "The isolated Claude profile login at $ConfigDir expires in $when. Re-authenticate before then: run 'claude' with CLAUDE_CONFIG_DIR set to it and sign in with /login."
+}
+
+# True when a probe result failed because the agent could not authenticate,
+# which is the only case the read-only fallback can help with.
+function Test-ClaudeAuthFailure {
+    [CmdletBinding()]
+    param($Result)
+
+    if (-not $Result) {
+        return $false
+    }
+    if ([bool](Get-JsonPropertyValue -InputObject $Result -Name "success")) {
+        return $false
+    }
+    $text = [string](Get-JsonPropertyValue -InputObject $Result -Name "error")
+    if (-not $text) {
+        return $false
+    }
+    foreach ($marker in @(
+            "OAuth session expired",
+            "could not be refreshed",
+            "Failed to authenticate",
+            "authentication_error",
+            "Invalid bearer token",
+            "please run /login"
+        )) {
+        if ($text -like "*$marker*") {
+            return $true
+        }
+    }
+    return $false
+}
+
+# Read-only fallback used when the isolated profile is signed out. It spends a
+# token of Claude quota through the default profile's access token WITHOUT ever
+# refreshing, rotating, or writing it - rotating a shared refresh token is what
+# signs Claude Code out of its own session. When that token is cold the probe
+# reports a skip rather than sending a request that can only 401.
+function Invoke-ClaudeReadOnlyProbe {
+    [CmdletBinding()]
+    param(
+        [string]$Model = "claude-haiku-4-5-20251001",
+        [string]$Prompt = "Reply with exactly: hi",
+        [int]$TimeoutSeconds = 60,
+        [string]$CredentialsPath,
+        [scriptblock]$Sender
+    )
+
+    $token = Get-ClaudeReadOnlyToken -CredentialsPath $CredentialsPath
+    if (-not $token) {
+        return [pscustomobject]@{
+            name    = "Claude"
+            success = $false
+            skipped = $true
+            exitCode = $null
+            error   = "Claude Code's access token is expired, so the read-only fallback was skipped. Use Claude Code once to renew it, or re-authenticate the isolated profile."
+        }
+    }
+
+    $body = @{
+        model      = $Model
+        max_tokens = 16
+        # Anthropic rejects Claude Code OAuth tokens that do not identify
+        # themselves as Claude Code.
+        system     = "You are Claude Code, Anthropic's official CLI for Claude."
+        messages   = @(@{ role = "user"; content = $Prompt })
+    } | ConvertTo-Json -Depth 6 -Compress
+
+    $headers = @{
+        "Authorization"     = "Bearer $token"
+        "anthropic-version" = "2023-06-01"
+        "anthropic-beta"    = "oauth-2025-04-20"
+        "content-type"      = "application/json"
+    }
+
+    try {
+        if ($Sender) {
+            $null = & $Sender $headers $body
+        }
+        else {
+            $null = Invoke-RestMethod `
+                -Method Post `
+                -Uri "https://api.anthropic.com/v1/messages" `
+                -Headers $headers `
+                -Body $body `
+                -TimeoutSec $TimeoutSeconds `
+                -ErrorAction Stop
+        }
+    }
+    catch {
+        $detail = $_.Exception.Message
+        $detail = $detail -replace "(?i)\b(bearer|token|api[_ -]?key)\s*[:=]\s*\S+", '$1=[redacted]'
+        return [pscustomobject]@{
+            name     = "Claude"
+            success  = $false
+            skipped  = $false
+            exitCode = $null
+            error    = "Claude read-only fallback failed: $detail"
+        }
+    }
+
+    return [pscustomobject]@{
+        name     = "Claude"
+        success  = $true
+        skipped  = $false
+        exitCode = 0
+        error    = $null
+        via      = "read-only-fallback"
+    }
+}
+
 function Get-JsonLinesFailureDetail {
     [CmdletBinding()]
     param([string]$Output)
@@ -1811,6 +2064,12 @@ Export-ModuleMember -Function @(
     "Test-QuotaWakeScheduledTaskOwnership",
     "Resolve-CommandPath",
     "Resolve-InstalledAgentPath",
+    "Get-JsonPropertyValue",
+    "Get-ClaudeCredentialsPath",
+    "Get-ClaudeReadOnlyToken",
+    "Get-ClaudeLoginExpiryWarning",
+    "Test-ClaudeAuthFailure",
+    "Invoke-ClaudeReadOnlyProbe",
     "Get-JsonLinesFailureDetail",
     "Resolve-CodexCommandPath",
     "Get-DefaultInstallRoot",
