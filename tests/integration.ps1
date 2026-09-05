@@ -430,6 +430,10 @@ try {
         "status exposes Claude action count"
     Assert-True ($status.CodexActionCount -eq 0) `
         "status exposes Codex action count"
+    Assert-True (
+        (@($status.CodexAccounts.PSObject.Properties.Name) -join ",") -eq
+            "(default)"
+    ) "status reports the ambient Codex account when no homes are configured"
     Assert-True ($status.SuccessfulExecutedSlots -eq 1) `
         "status counts successful executed slots"
     Assert-True ($status.FailedExecutedSlots -eq 1) `
@@ -452,6 +456,48 @@ try {
         "a new future schedule has no pending missed slots"
     Assert-True ([bool]$status.NextScheduledSlot) `
         "status derives the next expected slot"
+
+    # A multi-account run writes one "codex:<name>" entry per account. Status
+    # must surface each of them and keep the legacy scalars pointing at the
+    # first configured account.
+    [IO.File]::WriteAllText(
+        (Join-Path $installRoot "state\last-result.json"),
+        ([ordered]@{
+            success = $true
+            results = [ordered]@{
+                "codex:work" = [ordered]@{
+                    name = "Codex:work"
+                    success = $true
+                    model = "gpt-work"
+                    actionCount = 0
+                    usage = [ordered]@{ totalTokens = 303 }
+                }
+                "codex:personal" = [ordered]@{
+                    name = "Codex:personal"
+                    success = $true
+                    model = "gpt-personal"
+                    actionCount = 0
+                    usage = [ordered]@{ totalTokens = 404 }
+                }
+            }
+        } | ConvertTo-Json -Depth 8),
+        (New-Object Text.UTF8Encoding($false))
+    )
+    $multiAccountStatus = & (Join-Path $repoRoot "status.ps1") `
+        -TaskName $taskName `
+        -InstallRoot $installRoot
+    Assert-True (
+        (@($multiAccountStatus.CodexAccounts.PSObject.Properties.Name) -join ",") -eq
+            "work,personal"
+    ) "status lists every Codex account in configured order"
+    Assert-True (
+        $multiAccountStatus.CodexAccounts.work.usage.totalTokens -eq 303 -and
+        $multiAccountStatus.CodexAccounts.personal.usage.totalTokens -eq 404
+    ) "status keeps per-account Codex usage separate"
+    Assert-True ($multiAccountStatus.CodexUsage.totalTokens -eq 303) `
+        "status scalars describe the first Codex account"
+    Assert-True ($multiAccountStatus.CodexModel -eq "gpt-work") `
+        "status reports the first Codex account model"
 
     if ($Live) {
         $liveConfig = Get-Content -LiteralPath $configPath -Raw |

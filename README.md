@@ -42,6 +42,39 @@ This can use the same Claude account, but the second login creates a separate
 OAuth token pair. Setup stores only the profile path and injects
 `CLAUDE_CONFIG_DIR` into Claude probes. It does not copy or store credentials.
 
+### Multiple Codex accounts
+
+Codex reads its credentials from `CODEX_HOME/auth.json`. Without configuration,
+probes use the ambient `~/.codex`, so they only ever keep whichever account
+`codex login` wrote there last awake. Give each account its own `CODEX_HOME` to
+probe all of them:
+
+```powershell
+$work = "$env:LOCALAPPDATA\QuotaWake\codex-work"
+$personal = "$env:LOCALAPPDATA\QuotaWake\codex-personal"
+New-Item -ItemType Directory -Force $work, $personal | Out-Null
+
+$env:CODEX_HOME = $work;     codex login   # sign in as the first account
+$env:CODEX_HOME = $personal; codex login   # sign in as the second account
+Remove-Item Env:\CODEX_HOME
+
+.\setup.ps1 -Agents Codex -CodexHomes "work=$work","personal=$personal"
+```
+
+Each entry is `name=path`. Setup refuses a path without an `auth.json`, so a
+signed-out account is caught at install time instead of failing silently every
+five hours. Names appear in run history and status as `codex:<name>`; a run
+succeeds only when every configured account succeeds.
+
+These logins are independent of the one Codex CLI uses interactively, so running
+`codex login` for a different account later does not disturb the probes. Each
+probe refreshes its own home's access token; a refresh token that is revoked
+(for example by running `codex logout` against that home) has to be re-minted by
+signing that home in again.
+
+Omit `-CodexHomes` to keep the previous single-probe behaviour and the plain
+`codex` result key.
+
 ## Schedule modes
 
 Without a start time, the first run is within two minutes and repeats continuously:
@@ -82,6 +115,7 @@ $status = .\status.ps1
 $status | Format-List
 $status.ClaudeUsage
 $status.CodexUsage
+$status.CodexAccounts
 $status | Select-Object SuccessfulExecutedSlots,FailedExecutedSlots,MissedSlots,MissedGroups,PendingMissedSlots,LastMissedSlot,LastMissedReason,LastSuccessfulSlot,NextScheduledSlot
 ```
 
@@ -90,6 +124,10 @@ usage, model, timing, and zero-action proof are saved locally; raw CLI payloads
 are not. Each probe runs from an empty directory with tools and project/user
 instructions disabled for that call only. Claude's system prompt and Codex's
 base instructions are replaced with probe-only instructions.
+
+`CodexUsage`, `CodexModel`, and `CodexActionCount` describe the first Codex
+account. `CodexAccounts` holds one entry per account, keyed by the configured
+name (or `(default)` when no `-CodexHomes` are configured).
 
 `OwnershipConflict` reports a same-named Scheduled Task that Quota Wake will
 not replace or remove. `InstallOwned` confirms the local files carry matching

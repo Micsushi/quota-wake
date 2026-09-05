@@ -405,7 +405,7 @@ function Get-AgentFailureGuidance {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet("Claude", "Codex")]
+        [ValidatePattern("^(Claude|Codex(:.+)?)$")]
         [string]$Agent,
 
         [Parameter(Mandatory = $true)]
@@ -417,6 +417,15 @@ function Get-AgentFailureGuidance {
             "Claude is not ready: $Problem " +
             "Confirm Claude Code is installed and claude.exe is in PATH, " +
             "run 'claude' to sign in, then rerun setup with -Agents Claude."
+        )
+    }
+    if ($Agent.StartsWith("Codex:")) {
+        $accountName = $Agent.Substring("Codex:".Length)
+        return (
+            "Codex account '$accountName' is not ready: $Problem " +
+            "Confirm Codex CLI is installed and codex.exe is available, " +
+            "run 'codex' with CODEX_HOME set to that account's home and sign " +
+            "in, then rerun setup."
         )
     }
     return (
@@ -469,6 +478,46 @@ function Resolve-InstalledAgentPath {
     return Resolve-AgentProcessPath -Agent $Agent
 }
 
+# Codex reads credentials from CODEX_HOME/auth.json, so one probe per configured
+# home keeps every signed-in account awake instead of only whichever one
+# `codex login` last wrote to the ambient ~/.codex. No configured homes keeps the
+# historical single-probe behaviour and the plain "Codex" result key.
+function Get-CodexHomeSelection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Config
+    )
+
+    $homes = $null
+    $codexProperty = $Config.PSObject.Properties["codex"]
+    if ($codexProperty -and $codexProperty.Value) {
+        $homesProperty = $codexProperty.Value.PSObject.Properties["homes"]
+        if ($homesProperty) {
+            $homes = @($homesProperty.Value)
+        }
+    }
+
+    if (-not $homes -or @($homes).Count -eq 0) {
+        return @([pscustomobject]@{ Name = "Codex"; Home = $null })
+    }
+
+    foreach ($entry in $homes) {
+        $accountName = [string](Get-JsonPropertyValue -InputObject $entry -Name "name")
+        $accountHome = [string](Get-JsonPropertyValue -InputObject $entry -Name "home")
+        if ([string]::IsNullOrWhiteSpace($accountName)) {
+            throw "Each Codex home entry requires a non-empty 'name'."
+        }
+        if ([string]::IsNullOrWhiteSpace($accountHome)) {
+            throw "Codex home entry '$accountName' requires a non-empty 'home'."
+        }
+        [pscustomobject]@{
+            Name = "Codex:$accountName"
+            Home = $accountHome
+        }
+    }
+}
+
 function Get-AgentProcessSpecifications {
     [CmdletBinding()]
     param(
@@ -498,6 +547,7 @@ function Get-AgentProcessSpecifications {
             }
             [pscustomobject]@{
                 Name         = "Claude"
+                Agent        = "Claude"
                 FilePath     = Resolve-InstalledAgentPath `
                     -Agent "Claude" `
                     -ConfiguredPath ([string]$Config.claude.path)
@@ -530,69 +580,77 @@ function Get-AgentProcessSpecifications {
             continue
         }
 
-        [pscustomobject]@{
-            Name         = "Codex"
-            FilePath     = Resolve-InstalledAgentPath `
-                -Agent "Codex" `
-                -ConfiguredPath ([string]$Config.codex.path)
-            Model        = [string]$Config.codex.model
-            WorkingDirectory = $WorkingDirectory
-            OutputFormat = "CodexJson"
-            EnvironmentVariables = @{}
-            ArgumentList = @(
-                "exec",
-                "--ephemeral",
-                "--skip-git-repo-check",
-                "--ignore-user-config",
-                "--ignore-rules",
-                "--disable",
-                "shell_tool",
-                "--disable",
-                "plugins",
-                "--disable",
-                "apps",
-                "--disable",
-                "browser_use",
-                "--disable",
-                "browser_use_external",
-                "--disable",
-                "browser_use_full_cdp_access",
-                "--disable",
-                "computer_use",
-                "--disable",
-                "goals",
-                "--disable",
-                "hooks",
-                "--disable",
-                "skill_search",
-                "--disable",
-                "multi_agent",
-                "--disable",
-                "image_generation",
-                "--disable",
-                "in_app_browser",
-                "--disable",
-                "tool_suggest",
-                "--disable",
-                "workspace_dependencies",
-                "-c",
-                "project_doc_max_bytes=0",
-                "-c",
-                (
-                    'model_instructions_file="{0}"' -f
-                    ([string]$Config.codex.instructionsPath).Replace('\', '/')
-                ),
-                "--color",
-                "never",
-                "--json",
-                "-m",
-                [string]$Config.codex.model,
-                "-s",
-                "read-only",
-                "-C",
-                $WorkingDirectory,
-                [string]$Config.codex.prompt
-            )
+        $codexPath = Resolve-InstalledAgentPath `
+            -Agent "Codex" `
+            -ConfiguredPath ([string]$Config.codex.path)
+        foreach ($codexHome in @(Get-CodexHomeSelection -Config $Config)) {
+            $codexEnvironment = @{}
+            if (-not [string]::IsNullOrWhiteSpace($codexHome.Home)) {
+                $codexEnvironment["CODEX_HOME"] = [string]$codexHome.Home
+            }
+            [pscustomobject]@{
+                Name         = [string]$codexHome.Name
+                Agent        = "Codex"
+                FilePath     = $codexPath
+                Model        = [string]$Config.codex.model
+                WorkingDirectory = $WorkingDirectory
+                OutputFormat = "CodexJson"
+                EnvironmentVariables = $codexEnvironment
+                ArgumentList = @(
+                    "exec",
+                    "--ephemeral",
+                    "--skip-git-repo-check",
+                    "--ignore-user-config",
+                    "--ignore-rules",
+                    "--disable",
+                    "shell_tool",
+                    "--disable",
+                    "plugins",
+                    "--disable",
+                    "apps",
+                    "--disable",
+                    "browser_use",
+                    "--disable",
+                    "browser_use_external",
+                    "--disable",
+                    "browser_use_full_cdp_access",
+                    "--disable",
+                    "computer_use",
+                    "--disable",
+                    "goals",
+                    "--disable",
+                    "hooks",
+                    "--disable",
+                    "skill_search",
+                    "--disable",
+                    "multi_agent",
+                    "--disable",
+                    "image_generation",
+                    "--disable",
+                    "in_app_browser",
+                    "--disable",
+                    "tool_suggest",
+                    "--disable",
+                    "workspace_dependencies",
+                    "-c",
+                    "project_doc_max_bytes=0",
+                    "-c",
+                    (
+                        'model_instructions_file="{0}"' -f
+                        ([string]$Config.codex.instructionsPath).Replace('\', '/')
+                    ),
+                    "--color",
+                    "never",
+                    "--json",
+                    "-m",
+                    [string]$Config.codex.model,
+                    "-s",
+                    "read-only",
+                    "-C",
+                    $WorkingDirectory,
+                    [string]$Config.codex.prompt
+                )
+            }
         }
     }
 }
@@ -2080,6 +2138,7 @@ Export-ModuleMember -Function @(
     "Resolve-AgentSelection",
     "Get-AgentFailureGuidance",
     "Resolve-AgentProcessPath",
+    "Get-CodexHomeSelection",
     "Get-AgentProcessSpecifications",
     "Start-HiddenProcess",
     "Stop-QuotaWakeProcessTree",

@@ -37,6 +37,13 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$CodexModel = "gpt-5.4-mini",
 
+    # One "name=path" entry per Codex account, e.g.
+    # -CodexHomes "work=C:\...\codex-work","personal=C:\...\codex-personal".
+    # Each path is a CODEX_HOME with its own auth.json, so every listed account
+    # gets its own probe. Omit to probe only whichever account currently owns
+    # the ambient ~/.codex.
+    [string[]]$CodexHomes,
+
     [ValidateNotNullOrEmpty()]
     [string]$TaskName = "QuotaWake",
 
@@ -78,6 +85,46 @@ if (-not $InstallRoot) {
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot)
 if ($ClaudeConfigDir) {
     $ClaudeConfigDir = [IO.Path]::GetFullPath($ClaudeConfigDir)
+}
+
+$parsedCodexHomes = @()
+foreach ($entry in @($CodexHomes)) {
+    if ([string]::IsNullOrWhiteSpace($entry)) {
+        continue
+    }
+    $separator = $entry.IndexOf("=")
+    if ($separator -lt 1) {
+        throw "Invalid -CodexHomes entry '$entry'. Use 'name=path'."
+    }
+    $accountName = $entry.Substring(0, $separator).Trim()
+    $accountHome = $entry.Substring($separator + 1).Trim()
+    if ($accountName -notmatch "^[A-Za-z0-9._-]+$") {
+        throw (
+            "Invalid Codex account name '$accountName'. Use letters, digits, " +
+            "dot, dash, or underscore."
+        )
+    }
+    if ([string]::IsNullOrWhiteSpace($accountHome)) {
+        throw "Codex account '$accountName' needs a CODEX_HOME path."
+    }
+    $accountHome = [IO.Path]::GetFullPath($accountHome)
+    if (@($parsedCodexHomes | Where-Object { $_.name -eq $accountName })) {
+        throw "Duplicate Codex account name '$accountName' in -CodexHomes."
+    }
+    # A CODEX_HOME without auth.json makes the probe fail at run time with an
+    # opaque signed-out error, so refuse it while setup can still explain how to
+    # sign that account in.
+    $accountAuthPath = Join-Path $accountHome "auth.json"
+    if (-not (Test-Path -LiteralPath $accountAuthPath -PathType Leaf)) {
+        throw (
+            "Codex account '$accountName' has no auth.json at $accountAuthPath. " +
+            "Run: `$env:CODEX_HOME='$accountHome'; codex login  -- then rerun setup."
+        )
+    }
+    $parsedCodexHomes += [ordered]@{ name = $accountName; home = $accountHome }
+}
+if ($parsedCodexHomes.Count -gt 0 -and $selectedAgents -notcontains "Codex") {
+    throw "-CodexHomes requires -Agents to include Codex."
 }
 
 $powershellPath = Resolve-CommandPath "powershell.exe"
@@ -345,6 +392,9 @@ if ($selectedAgents -contains "Codex") {
         prompt           = $prompt
         instructionsPath = $stagingCodexInstructionsPath
     }
+    if ($parsedCodexHomes.Count -gt 0) {
+        $config["codex"]["homes"] = $parsedCodexHomes
+    }
 }
 
 try {
@@ -391,7 +441,23 @@ try {
                     -Raw | ConvertFrom-Json
             }
 
-            $guidance = foreach ($agent in $selectedAgents) {
+            # Codex fans out to one result per configured account, so report
+            # against those names rather than the bare agent selection.
+            $verifiedAgents = @(
+                $selectedAgents | Where-Object { $_ -ne "Codex" }
+            )
+            if ($selectedAgents -contains "Codex") {
+                if ($parsedCodexHomes.Count -gt 0) {
+                    $verifiedAgents += @(
+                        $parsedCodexHomes | ForEach-Object { "Codex:$($_.name)" }
+                    )
+                }
+                else {
+                    $verifiedAgents += "Codex"
+                }
+            }
+
+            $guidance = foreach ($agent in $verifiedAgents) {
                 $problem = "verification did not complete successfully."
                 $resultProperty = $null
                 if ($lastResult -and $lastResult.results) {

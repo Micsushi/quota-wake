@@ -18,6 +18,7 @@ $config = $null
 $selectedAgents = @()
 $handles = @()
 $results = @{}
+$specifications = @()
 $runDirectory = $null
 $cleanupError = $null
 $startedAt = [DateTimeOffset]::Now
@@ -250,7 +251,7 @@ try {
     foreach ($specification in $specifications) {
         try {
             $processPath = Resolve-AgentProcessPath `
-                -Agent $specification.Name `
+                -Agent $specification.Agent `
                 -ConfiguredPath $specification.FilePath
             $handles += Start-HiddenProcess `
                 -Name $specification.Name `
@@ -317,7 +318,14 @@ catch {
         }
     }
 
-    foreach ($agent in $selectedAgents) {
+    # Prefer the resolved specification names so a Codex fan-out records one
+    # failure per account. Falls back to the selection when the failure happened
+    # before specifications were built.
+    $failureNames = @($selectedAgents)
+    if ($specifications -and @($specifications).Count -gt 0) {
+        $failureNames = @($specifications | ForEach-Object { [string]$_.Name })
+    }
+    foreach ($agent in $failureNames) {
         if (-not $results.ContainsKey($agent)) {
             $results[$agent] = [pscustomobject]@{
                 name = $agent; success = $false; exitCode = $null
@@ -345,9 +353,25 @@ finally {
 
 $resultMap = [ordered]@{}
 $success = $true
-if ($selectedAgents.Count -gt 0) {
-    foreach ($agent in $selectedAgents) {
-        $agentResult = $results[$agent]
+# Codex fans out to one probe per configured CODEX_HOME, so the recorded keys
+# come from the specifications ("codex:work") rather than the agent selection.
+# Without configured homes a single spec named "Codex" keeps the legacy key.
+$resultNames = @($selectedAgents)
+if ($specifications -and @($specifications).Count -gt 0) {
+    $resultNames = @($specifications | ForEach-Object { [string]$_.Name })
+}
+if ($resultNames.Count -gt 0) {
+    foreach ($agent in $resultNames) {
+        $agentResult = $null
+        if ($results.ContainsKey($agent)) {
+            $agentResult = $results[$agent]
+        }
+        if (-not $agentResult) {
+            $agentResult = [pscustomobject]@{
+                name = $agent; success = $false; exitCode = $null
+                error = "$agent produced no result."
+            }
+        }
         $resultMap[$agent.ToLowerInvariant()] = $agentResult
         if (-not $agentResult.success) {
             $success = $false

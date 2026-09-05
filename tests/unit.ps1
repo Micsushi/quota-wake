@@ -145,6 +145,84 @@ Assert-True (
     [regex]::Escape("C:/Quota Wake/runtime/codex-instructions.txt")
 ) "Codex receives the configured minimal instruction file"
 
+Assert-Equal "Codex" $codexSpecifications[0].Agent `
+    "Codex specification records its base agent"
+Assert-Equal 0 $codexSpecifications[0].EnvironmentVariables.Count `
+    "Codex without configured homes inherits the ambient CODEX_HOME"
+
+$multiAccountConfig = [pscustomobject]@{
+    workingDirectory = "C:\Quota Wake"
+    codex = [pscustomobject]@{
+        path = "C:\Tools\codex.exe"
+        model = "gpt-5.4-mini"
+        prompt = "Reply with exactly: hi"
+        instructionsPath = "C:\Quota Wake\runtime\codex-instructions.txt"
+        homes = @(
+            [pscustomobject]@{
+                name = "work"; home = "C:\Quota Wake\codex-work"
+            }
+            [pscustomobject]@{
+                name = "personal"; home = "C:\Quota Wake\codex-personal"
+            }
+        )
+    }
+}
+$multiAccountSpecifications = @(Get-AgentProcessSpecifications `
+    -Agents @("Codex") `
+    -Config $multiAccountConfig `
+    -WorkingDirectory "C:\Quota Wake\probe\run-test")
+Assert-Equal 2 $multiAccountSpecifications.Count `
+    "each configured Codex home gets its own probe"
+Assert-Equal "Codex:work" $multiAccountSpecifications[0].Name `
+    "Codex accounts are named per home"
+Assert-Equal "Codex:personal" $multiAccountSpecifications[1].Name `
+    "Codex accounts keep their configured order"
+Assert-Equal "Codex" $multiAccountSpecifications[0].Agent `
+    "fanned-out Codex specifications still resolve the Codex executable"
+Assert-Equal "C:\Quota Wake\codex-work" `
+    $multiAccountSpecifications[0].EnvironmentVariables["CODEX_HOME"] `
+    "each Codex probe reads its own credential home"
+Assert-Equal "C:\Quota Wake\codex-personal" `
+    $multiAccountSpecifications[1].EnvironmentVariables["CODEX_HOME"] `
+    "Codex homes are not shared between accounts"
+Assert-Equal $codexSpecifications[0].ArgumentList.Count `
+    $multiAccountSpecifications[0].ArgumentList.Count `
+    "multi-account probes keep the single-account argument list"
+
+foreach ($invalidHome in @(
+    [pscustomobject]@{ name = ""; home = "C:\Quota Wake\codex-work" },
+    [pscustomobject]@{ name = "work"; home = "" }
+)) {
+    $invalidConfig = [pscustomobject]@{
+        workingDirectory = "C:\Quota Wake"
+        codex = [pscustomobject]@{
+            path = "C:\Tools\codex.exe"
+            model = "gpt-5.4-mini"
+            prompt = "Reply with exactly: hi"
+            instructionsPath = "C:\Quota Wake\runtime\codex-instructions.txt"
+            homes = @($invalidHome)
+        }
+    }
+    $rejected = $false
+    try {
+        [void]@(Get-AgentProcessSpecifications `
+            -Agents @("Codex") `
+            -Config $invalidConfig)
+    }
+    catch {
+        $rejected = $true
+    }
+    Assert-True $rejected "incomplete Codex home entries are rejected"
+}
+
+$accountGuidance = Get-AgentFailureGuidance `
+    -Agent "Codex:work" `
+    -Problem "exited with code 1"
+Assert-True ($accountGuidance -match "account 'work'") `
+    "Codex failure guidance names the failing account"
+Assert-True ($accountGuidance -match "CODEX_HOME") `
+    "Codex failure guidance explains which credential home to sign in"
+
 $guidance = Get-AgentFailureGuidance `
     -Agent "Claude" `
     -Problem "exited with code 1"

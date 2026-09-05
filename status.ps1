@@ -72,6 +72,7 @@ $claudeModel = $null
 $codexModel = $null
 $claudeActionCount = $null
 $codexActionCount = $null
+$codexAccounts = [ordered]@{}
 if (Test-Path -LiteralPath $lastResultPath) {
     try {
         $lastResult = Get-Content `
@@ -83,10 +84,25 @@ if (Test-Path -LiteralPath $lastResultPath) {
                 $claudeModel = $lastResult.results.claude.model
                 $claudeActionCount = $lastResult.results.claude.actionCount
             }
-            if ($lastResult.results.PSObject.Properties["codex"]) {
-                $codexUsage = $lastResult.results.codex.usage
-                $codexModel = $lastResult.results.codex.model
-                $codexActionCount = $lastResult.results.codex.actionCount
+            # With multiple CODEX_HOME accounts the worker writes one
+            # "codex:<account>" entry each; a single ambient account still
+            # writes the plain "codex" key.
+            foreach ($property in $lastResult.results.PSObject.Properties) {
+                if ($property.Name -eq "codex") {
+                    $codexAccounts["(default)"] = $property.Value
+                }
+                elseif ($property.Name -like "codex:*") {
+                    $accountName = $property.Name.Substring("codex:".Length)
+                    $codexAccounts[$accountName] = $property.Value
+                }
+            }
+            if ($codexAccounts.Count -gt 0) {
+                # Back-compat scalars describe the first account; per-account
+                # detail lives in CodexAccounts.
+                $firstCodex = @($codexAccounts.Values)[0]
+                $codexUsage = $firstCodex.usage
+                $codexModel = $firstCodex.model
+                $codexActionCount = $firstCodex.actionCount
             }
         }
     }
@@ -284,6 +300,7 @@ $status = [ordered]@{
     CodexModel        = $codexModel
     CodexUsage        = $codexUsage
     CodexActionCount  = $codexActionCount
+    CodexAccounts     = [pscustomobject]$codexAccounts
 }
 if ($task -and $taskOwned) {
     $taskInfo = Get-ScheduledTaskInfo `

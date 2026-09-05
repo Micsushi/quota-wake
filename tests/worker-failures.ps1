@@ -228,6 +228,81 @@ try {
         $partialStartupResult.results.codex.error -notmatch
             "configuration or startup"
     ) "Claude startup failure is not copied onto Codex"
+
+    # Multiple CODEX_HOME accounts must each get their own probe and their own
+    # result entry, so one signed-out account cannot hide behind another.
+    $multiAccountRoot = Join-Path $testRoot "codex-multi-account"
+    $multiAccountRuntime = Join-Path $multiAccountRoot "runtime"
+    $multiAccountState = Join-Path $multiAccountRoot "state"
+    $multiAccountProbe = Join-Path $multiAccountRoot "probe"
+    $multiAccountWorkHome = Join-Path $multiAccountRoot "codex-work"
+    $multiAccountPersonalHome = Join-Path $multiAccountRoot "codex-personal"
+    foreach ($directory in @(
+        $multiAccountRuntime,
+        $multiAccountState,
+        $multiAccountProbe,
+        $multiAccountWorkHome,
+        $multiAccountPersonalHome
+    )) {
+        [void](New-Item -ItemType Directory -Path $directory -Force)
+    }
+    $multiAccountInstructions = Join-Path `
+        $multiAccountRuntime `
+        "codex-instructions.txt"
+    [IO.File]::WriteAllText($multiAccountInstructions, "Reply with exactly: hi")
+    $multiAccountConfigPath = Join-Path $multiAccountRuntime "config.json"
+    [IO.File]::WriteAllText(
+        $multiAccountConfigPath,
+        ([ordered]@{
+            schemaVersion = 3
+            agents = @("Codex")
+            timeoutSeconds = 10
+            notificationsEnabled = $false
+            workingDirectory = $multiAccountProbe
+            stateDirectory = $multiAccountState
+            codex = [ordered]@{
+                path = Join-Path $env:SystemRoot "System32\where.exe"
+                model = "gpt-test-mini"
+                prompt = "Reply with exactly: hi"
+                instructionsPath = $multiAccountInstructions
+                homes = @(
+                    [ordered]@{ name = "work"; home = $multiAccountWorkHome }
+                    [ordered]@{
+                        name = "personal"
+                        home = $multiAccountPersonalHome
+                    }
+                )
+            }
+        } | ConvertTo-Json -Depth 6)
+    )
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    [void](& powershell.exe `
+        -NoLogo `
+        -NoProfile `
+        -NonInteractive `
+        -ExecutionPolicy Bypass `
+        -File (Join-Path $repoRoot "src\run-quota-wake.ps1") `
+        -ConfigPath $multiAccountConfigPath `
+        -SuppressNotifications 2>&1)
+    $ErrorActionPreference = $previousErrorActionPreference
+
+    $multiAccountResult = Get-Content `
+        -LiteralPath (Join-Path $multiAccountState "last-result.json") `
+        -Raw | ConvertFrom-Json
+    Assert-True (
+        [bool]$multiAccountResult.results.PSObject.Properties["codex:work"]
+    ) "each Codex account gets its own result entry"
+    Assert-True (
+        [bool]$multiAccountResult.results.PSObject.Properties["codex:personal"]
+    ) "the second Codex account is probed too"
+    Assert-True (
+        -not $multiAccountResult.results.PSObject.Properties["codex"]
+    ) "named Codex accounts replace the ambient result key"
+    Assert-True (
+        $multiAccountResult.results."codex:work".name -eq "Codex:work"
+    ) "Codex account results carry their account name"
 }
 finally {
     if (Test-Path -LiteralPath $testRoot) {
