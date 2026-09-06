@@ -189,6 +189,29 @@ Assert-Equal $codexSpecifications[0].ArgumentList.Count `
     $multiAccountSpecifications[0].ArgumentList.Count `
     "multi-account probes keep the single-account argument list"
 
+$duplicateHomeConfig = [pscustomobject]@{
+    workingDirectory = "C:\Quota Wake"
+    codex = [pscustomobject]@{
+        path = "C:\Tools\codex.exe"
+        model = "gpt-5.4-mini"
+        prompt = "Reply with exactly: hi"
+        homes = @(
+            [pscustomobject]@{ name = "work"; home = "C:\Quota Wake\codex-work" }
+            [pscustomobject]@{ name = "personal"; home = "C:\Quota Wake\codex-work\." }
+        )
+    }
+}
+$rejectedDuplicateHome = $false
+try {
+    [void]@(Get-AgentProcessSpecifications `
+        -Agents @("Codex") `
+        -Config $duplicateHomeConfig)
+}
+catch {
+    $rejectedDuplicateHome = $true
+}
+Assert-True $rejectedDuplicateHome "duplicate Codex home paths are rejected"
+
 foreach ($invalidHome in @(
     [pscustomobject]@{ name = ""; home = "C:\Quota Wake\codex-work" },
     [pscustomobject]@{ name = "work"; home = "" }

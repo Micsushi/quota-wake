@@ -66,11 +66,12 @@ signed-out account is caught at install time instead of failing silently every
 five hours. Names appear in run history and status as `codex:<name>`; a run
 succeeds only when every configured account succeeds.
 
-These logins are independent of the one Codex CLI uses interactively, so running
-`codex login` for a different account later does not disturb the probes. Each
-probe refreshes its own home's access token; a refresh token that is revoked
-(for example by running `codex logout` against that home) has to be re-minted by
-signing that home in again.
+These homes isolate the credential files from the one Codex CLI uses
+interactively, but they do not create independent server-side grants. A new
+`codex login` for an account from any `CODEX_HOME` can revoke that account's
+existing grant, so sign that account in again in its configured home before
+expecting the probe to recover. A refresh token that is revoked (for example by
+running `codex logout` against that home) likewise has to be re-minted there.
 
 Omit `-CodexHomes` to keep the previous single-probe behaviour and the plain
 `codex` result key.

@@ -498,20 +498,45 @@ function Get-CodexHomeSelection {
         }
     }
 
-    if (-not $homes -or @($homes).Count -eq 0) {
-        return @([pscustomobject]@{ Name = "Codex"; Home = $null })
-    }
+	if (-not $homes -or @($homes).Count -eq 0) {
+		return @([pscustomobject]@{ Name = "Codex"; Home = $null })
+	}
 
-    foreach ($entry in $homes) {
+	$accountNames = @{}
+	$homeKeys = @{}
+	foreach ($entry in $homes) {
         $accountName = [string](Get-JsonPropertyValue -InputObject $entry -Name "name")
         $accountHome = [string](Get-JsonPropertyValue -InputObject $entry -Name "home")
         if ([string]::IsNullOrWhiteSpace($accountName)) {
             throw "Each Codex home entry requires a non-empty 'name'."
         }
-        if ([string]::IsNullOrWhiteSpace($accountHome)) {
-            throw "Codex home entry '$accountName' requires a non-empty 'home'."
-        }
-        [pscustomobject]@{
+		if ($accountName -notmatch "^[A-Za-z0-9._-]+$") {
+			throw (
+				"Invalid Codex account name '$accountName'. Use letters, digits, " +
+				"dot, dash, or underscore."
+			)
+		}
+		if ($accountNames.ContainsKey($accountName)) {
+			throw "Duplicate Codex account name '$accountName'."
+		}
+		if ([string]::IsNullOrWhiteSpace($accountHome)) {
+			throw "Codex home entry '$accountName' requires a non-empty 'home'."
+		}
+		$accountNames[$accountName] = $true
+		$fullHome = [IO.Path]::GetFullPath($accountHome)
+		$homeKey = $fullHome.TrimEnd('\', '/')
+		$pathRoot = [IO.Path]::GetPathRoot($fullHome)
+		if ($pathRoot -and $fullHome -eq $pathRoot) {
+			$homeKey = $pathRoot
+		}
+		if ($homeKeys.ContainsKey($homeKey)) {
+			throw (
+				"Codex accounts '$($homeKeys[$homeKey])' and '$accountName' " +
+				"use the same CODEX_HOME path '$accountHome'."
+			)
+		}
+		$homeKeys[$homeKey] = $accountName
+		[pscustomobject]@{
             Name = "Codex:$accountName"
             Home = $accountHome
         }

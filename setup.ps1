@@ -88,6 +88,7 @@ if ($ClaudeConfigDir) {
 }
 
 $parsedCodexHomes = @()
+$codexHomeKeys = @{}
 foreach ($entry in @($CodexHomes)) {
     if ([string]::IsNullOrWhiteSpace($entry)) {
         continue
@@ -111,6 +112,17 @@ foreach ($entry in @($CodexHomes)) {
     if (@($parsedCodexHomes | Where-Object { $_.name -eq $accountName })) {
         throw "Duplicate Codex account name '$accountName' in -CodexHomes."
     }
+    $homeKey = $accountHome.TrimEnd('\', '/')
+    $pathRoot = [IO.Path]::GetPathRoot($accountHome)
+    if ($pathRoot -and $accountHome -eq $pathRoot) {
+        $homeKey = $pathRoot
+    }
+    if ($codexHomeKeys.ContainsKey($homeKey)) {
+        throw (
+            "Codex accounts '$($codexHomeKeys[$homeKey])' and '$accountName' " +
+            "use the same CODEX_HOME path '$accountHome'."
+        )
+    }
     # A CODEX_HOME without auth.json makes the probe fail at run time with an
     # opaque signed-out error, so refuse it while setup can still explain how to
     # sign that account in.
@@ -121,6 +133,7 @@ foreach ($entry in @($CodexHomes)) {
             "Run: `$env:CODEX_HOME='$accountHome'; codex login  -- then rerun setup."
         )
     }
+    $codexHomeKeys[$homeKey] = $accountName
     $parsedCodexHomes += [ordered]@{ name = $accountName; home = $accountHome }
 }
 if ($parsedCodexHomes.Count -gt 0 -and $selectedAgents -notcontains "Codex") {
