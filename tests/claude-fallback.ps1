@@ -127,9 +127,14 @@ Assert-True ($skipped.skipped) "a cold token is reported as skipped"
 $captured = $null
 $ok = Invoke-ClaudeReadOnlyProbe `
     -CredentialsPath (Join-Path $live ".credentials.json") `
-    -Sender { param($h, $b) $script:captured = @{ headers = $h; body = $b }; "{}" }
+    -Sender { param($h, $b) $script:captured = @{ headers = $h; body = $b }; '{"model":"haiku","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":4,"output_tokens":1}}' }
 Assert-True $ok.success "a live token produces a successful probe"
 Assert-Equal "read-only-fallback" $ok.via "the result records how it was obtained"
+Assert-Equal 5 $ok.usage.totalTokens "fallback retains token evidence"
+foreach ($response in @('{}', '{"content":[{"type":"text","text":"wrong"}],"usage":{"input_tokens":4,"output_tokens":1}}', '{"content":[{"type":"text","text":"hi"}]}')) {
+    $bad = Invoke-ClaudeReadOnlyProbe -CredentialsPath (Join-Path $live ".credentials.json") -Sender { param($h,$b) $response | ConvertFrom-Json }
+    Assert-True (-not $bad.success) "invalid response must not count as a successful wake"
+}
 Assert-Equal "Bearer live-token" $script:captured.headers["Authorization"] "the live token is sent"
 Assert-Equal "oauth-2025-04-20" $script:captured.headers["anthropic-beta"] "the OAuth beta header is sent"
 Assert-True ($script:captured.body -like "*Claude Code*") "the Claude Code system prompt is sent"

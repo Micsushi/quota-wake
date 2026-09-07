@@ -988,10 +988,10 @@ function Invoke-ClaudeReadOnlyProbe {
 
     try {
         if ($Sender) {
-            $null = & $Sender $headers $body
+            $response = & $Sender $headers $body
         }
         else {
-            $null = Invoke-RestMethod `
+            $response = Invoke-RestMethod `
                 -Method Post `
                 -Uri "https://api.anthropic.com/v1/messages" `
                 -Headers $headers `
@@ -999,6 +999,20 @@ function Invoke-ClaudeReadOnlyProbe {
                 -TimeoutSec $TimeoutSeconds `
                 -ErrorAction Stop
         }
+        if ($response -is [string]) { $response = $response | ConvertFrom-Json }
+        $blocks = @(Get-JsonPropertyValue -InputObject $response -Name "content")
+        if ($blocks.Count -ne 1 -or (Get-JsonPropertyValue $blocks[0] "type") -ne "text" -or
+            -not (Test-ExactHi -Output ([string](Get-JsonPropertyValue $blocks[0] "text")))) {
+            throw "Provider returned unexpected probe output."
+        }
+        $usage = Get-JsonPropertyValue $response "usage"
+        $inputTokens = Get-JsonPropertyValue $usage "input_tokens"
+        $outputTokens = Get-JsonPropertyValue $usage "output_tokens"
+        if ($null -eq $inputTokens -or $null -eq $outputTokens -or $inputTokens -lt 0 -or $outputTokens -le 0) {
+            throw "Provider did not report valid token usage."
+        }
+        $inputTokens = [long]$inputTokens
+        $outputTokens = [long]$outputTokens
     }
     catch {
         $detail = $_.Exception.Message
@@ -1019,6 +1033,10 @@ function Invoke-ClaudeReadOnlyProbe {
         exitCode = 0
         error    = $null
         via      = "read-only-fallback"
+        output   = "hi"
+        model    = [string](Get-JsonPropertyValue $response "model")
+        usage    = [pscustomobject]@{inputTokens=$inputTokens; outputTokens=$outputTokens; totalTokens=($inputTokens+$outputTokens)}
+        actionCount = 0
     }
 }
 
