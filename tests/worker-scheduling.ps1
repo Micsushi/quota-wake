@@ -7,12 +7,130 @@ function Assert-True {
     }
 }
 
+function Restore-QuotaWakeTestIsolation {
+    if (-not $script:QuotaWakeTestIsolationActive) {
+        return
+    }
+    $script:QuotaWakeTestIsolationActive = $false
+    foreach ($name in $script:QuotaWakeTestEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable(
+            $name,
+            $script:QuotaWakePreviousEnvironment[$name],
+            "Process"
+        )
+    }
+    if ([IO.Directory]::Exists($script:QuotaWakeTestIsolationRoot)) {
+        [IO.Directory]::Delete($script:QuotaWakeTestIsolationRoot, $true)
+    }
+}
+
+$script:QuotaWakePowerShellPath = (
+    Get-Command "powershell.exe" -CommandType Application -ErrorAction Stop |
+        Select-Object -First 1 -ExpandProperty Source
+)
+if (-not [IO.Path]::IsPathRooted($script:QuotaWakePowerShellPath)) {
+    throw "Windows PowerShell did not resolve to an absolute path."
+}
+$quotaWakeSystemRoot = [Environment]::GetEnvironmentVariable("SystemRoot", "Process")
+if (-not $quotaWakeSystemRoot) {
+    throw "Windows SystemRoot is unavailable."
+}
+$script:QuotaWakeTestIsolationRoot = Join-Path `
+    ([IO.Path]::GetTempPath()) `
+    "QuotaWake-Scheduling-Isolation-$([Guid]::NewGuid().ToString('N'))"
+$script:QuotaWakeTestEnvironmentNames = @(
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "XDG_CONFIG_HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+    "DATA_DIR",
+    "QUOTAWAKE_DATA_DIR",
+    "QUOTAWAKE_STATE_DIR",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "MCP_CONFIG_PATH",
+    "CODEX_CLI_PATH",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "QUOTAWAKE_TEST_MARKER",
+    "QUOTAWAKE_TEST_SLEEP_MS"
+)
+$script:QuotaWakePreviousEnvironment = @{}
+foreach ($name in $script:QuotaWakeTestEnvironmentNames) {
+    $script:QuotaWakePreviousEnvironment[$name] = `
+        [Environment]::GetEnvironmentVariable($name, "Process")
+}
+$script:QuotaWakeTestIsolationActive = $true
+trap {
+    Restore-QuotaWakeTestIsolation
+    throw
+}
+$quotaWakeTestPaths = [ordered]@{
+    Home          = Join-Path $script:QuotaWakeTestIsolationRoot "home"
+    UserProfile   = Join-Path $script:QuotaWakeTestIsolationRoot "userprofile"
+    XdgConfig     = Join-Path $script:QuotaWakeTestIsolationRoot "xdg-config"
+    AppData       = Join-Path $script:QuotaWakeTestIsolationRoot "appdata"
+    LocalAppData  = Join-Path $script:QuotaWakeTestIsolationRoot "localappdata"
+    Temp          = Join-Path $script:QuotaWakeTestIsolationRoot "temp"
+    Data          = Join-Path $script:QuotaWakeTestIsolationRoot "data"
+    State         = Join-Path $script:QuotaWakeTestIsolationRoot "state"
+    ClaudeConfig  = Join-Path $script:QuotaWakeTestIsolationRoot "claude-config"
+    ClaudeDefault = Join-Path $script:QuotaWakeTestIsolationRoot "userprofile\.claude"
+    CodexHome     = Join-Path $script:QuotaWakeTestIsolationRoot "codex-home"
+    McpConfig     = Join-Path $script:QuotaWakeTestIsolationRoot "mcp"
+    FixtureBin    = Join-Path $script:QuotaWakeTestIsolationRoot "fixture-bin"
+}
+[void](New-Item -ItemType Directory -Force -Path @($quotaWakeTestPaths.Values))
+$quotaWakeRestrictedPath = @(
+    $quotaWakeTestPaths.FixtureBin,
+    (Split-Path -Parent $script:QuotaWakePowerShellPath),
+    (Join-Path $quotaWakeSystemRoot "System32"),
+    $quotaWakeSystemRoot
+) -join ";"
+[Environment]::SetEnvironmentVariable("PATH", $quotaWakeRestrictedPath, "Process")
+[Environment]::SetEnvironmentVariable("HOME", $quotaWakeTestPaths.Home, "Process")
+[Environment]::SetEnvironmentVariable("USERPROFILE", $quotaWakeTestPaths.UserProfile, "Process")
+[Environment]::SetEnvironmentVariable("XDG_CONFIG_HOME", $quotaWakeTestPaths.XdgConfig, "Process")
+[Environment]::SetEnvironmentVariable("APPDATA", $quotaWakeTestPaths.AppData, "Process")
+[Environment]::SetEnvironmentVariable("LOCALAPPDATA", $quotaWakeTestPaths.LocalAppData, "Process")
+[Environment]::SetEnvironmentVariable("TEMP", $quotaWakeTestPaths.Temp, "Process")
+[Environment]::SetEnvironmentVariable("TMP", $quotaWakeTestPaths.Temp, "Process")
+[Environment]::SetEnvironmentVariable("DATA_DIR", $quotaWakeTestPaths.Data, "Process")
+[Environment]::SetEnvironmentVariable("QUOTAWAKE_DATA_DIR", $quotaWakeTestPaths.Data, "Process")
+[Environment]::SetEnvironmentVariable("QUOTAWAKE_STATE_DIR", $quotaWakeTestPaths.State, "Process")
+[Environment]::SetEnvironmentVariable("CLAUDE_CONFIG_DIR", $quotaWakeTestPaths.ClaudeConfig, "Process")
+[Environment]::SetEnvironmentVariable("CODEX_HOME", $quotaWakeTestPaths.CodexHome, "Process")
+[Environment]::SetEnvironmentVariable("MCP_CONFIG_PATH", (Join-Path $quotaWakeTestPaths.McpConfig "config.json"), "Process")
+foreach ($name in @(
+        "CODEX_CLI_PATH",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN"
+    )) {
+    [Environment]::SetEnvironmentVariable($name, $null, "Process")
+}
+
 function Invoke-Worker {
     param([string]$WorkerPath, [string]$ConfigPath)
 
     $previousPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    $output = & powershell.exe `
+    $output = & $script:QuotaWakePowerShellPath `
         -NoLogo `
         -NoProfile `
         -NonInteractive `
@@ -78,6 +196,32 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $modulePath = Join-Path $repoRoot "src\QuotaWake.psm1"
 $workerPath = Join-Path $repoRoot "src\run-quota-wake.ps1"
 Import-Module $modulePath -Force -DisableNameChecking
+$defaultCredentialPath = Get-ClaudeCredentialsPath
+Assert-True (
+    -not $defaultCredentialPath -or
+    [IO.Path]::GetFullPath($defaultCredentialPath).StartsWith(
+        [IO.Path]::GetFullPath($quotaWakeTestPaths.UserProfile),
+        [StringComparison]::OrdinalIgnoreCase
+    )
+) "default Claude credential lookup stays inside the disposable profile"
+$ambientClaudePath = $null
+try {
+    $ambientClaudePath = Resolve-CommandPath -Name "claude.exe"
+}
+catch {
+}
+Assert-True (-not $ambientClaudePath) `
+    "restricted PATH cannot resolve an ambient Claude executable"
+$missingClaudePath = $null
+try {
+    $missingClaudePath = Resolve-AgentProcessPath `
+        -Agent "Claude" `
+        -ConfiguredPath (Join-Path $script:QuotaWakeTestIsolationRoot "missing-agent.exe")
+}
+catch {
+}
+Assert-True (-not $missingClaudePath) `
+    "missing Claude fixture cannot fall through to an ambient executable"
 $testRoot = Join-Path `
     ([IO.Path]::GetTempPath()) `
     "QuotaWake-Scheduling-$([Guid]::NewGuid().ToString('N'))"
@@ -295,8 +439,8 @@ public static class Probe {
         -AgentPath $agentPath `
         -EffectiveFrom ([DateTimeOffset]::Now.AddSeconds(-10))
     $firstJob = Start-Job -ScriptBlock {
-        param($WorkerPath, $ConfigPath)
-        $output = & powershell.exe `
+        param($PowerShellPath, $WorkerPath, $ConfigPath)
+        $output = & $PowerShellPath `
             -NoLogo `
             -NoProfile `
             -NonInteractive `
@@ -308,7 +452,10 @@ public static class Probe {
             ExitCode = $LASTEXITCODE
             Output = ($output -join "`n")
         }
-    } -ArgumentList $workerPath, $lockConfig.ConfigPath
+    } -ArgumentList `
+        $script:QuotaWakePowerShellPath,
+        $workerPath,
+        $lockConfig.ConfigPath
     $markerDeadline = (Get-Date).AddSeconds(10)
     while (
         -not (Test-Path -LiteralPath $lockMarker) -and
@@ -336,11 +483,10 @@ public static class Probe {
     ) "worker lock prevents duplicate history"
 }
 finally {
-    Remove-Item Env:\QUOTAWAKE_TEST_MARKER -ErrorAction SilentlyContinue
-    Remove-Item Env:\QUOTAWAKE_TEST_SLEEP_MS -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $testRoot) {
         Remove-Item -LiteralPath $testRoot -Recurse -Force
     }
+    Restore-QuotaWakeTestIsolation
 }
 
 Write-Output "Worker scheduling tests passed."
