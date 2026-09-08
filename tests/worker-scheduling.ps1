@@ -55,6 +55,8 @@ $script:QuotaWakeTestEnvironmentNames = @(
     "MCP_CONFIG_PATH",
     "CODEX_CLI_PATH",
     "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_AUTH_TOKEN",
     "OPENAI_API_KEY",
     "AZURE_OPENAI_API_KEY",
     "GOOGLE_API_KEY",
@@ -114,6 +116,8 @@ $quotaWakeRestrictedPath = @(
 foreach ($name in @(
         "CODEX_CLI_PATH",
         "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_AUTH_TOKEN",
         "OPENAI_API_KEY",
         "AZURE_OPENAI_API_KEY",
         "GOOGLE_API_KEY",
@@ -225,6 +229,7 @@ Assert-True (-not $missingClaudePath) `
 $testRoot = Join-Path `
     ([IO.Path]::GetTempPath()) `
     "QuotaWake-Scheduling-$([Guid]::NewGuid().ToString('N'))"
+$firstJob = $null
 
 try {
     [void](New-Item -ItemType Directory -Path $testRoot -Force)
@@ -473,6 +478,7 @@ public static class Probe {
     [void](Wait-Job -Job $firstJob -Timeout 10)
     $firstJobResult = Receive-Job -Job $firstJob
     Remove-Job -Job $firstJob -Force
+    $firstJob = $null
     Assert-True ($firstJobResult.ExitCode -eq 0) "first worker succeeds"
     Assert-True (@(Get-Content -LiteralPath $lockMarker).Count -eq 1) `
         "worker lock prevents overlapping agent calls"
@@ -483,6 +489,11 @@ public static class Probe {
     ) "worker lock prevents duplicate history"
 }
 finally {
+    if ($firstJob) {
+        Stop-Job -Job $firstJob -ErrorAction SilentlyContinue
+        Remove-Job -Job $firstJob -Force -ErrorAction SilentlyContinue
+        $firstJob = $null
+    }
     if (Test-Path -LiteralPath $testRoot) {
         Remove-Item -LiteralPath $testRoot -Recurse -Force
     }
