@@ -74,8 +74,9 @@ foreach ($name in $script:QuotaWakeTestEnvironmentNames) {
 }
 $script:QuotaWakeTestIsolationActive = $true
 trap {
+    $quotaWakeTestFailure = $_
     Restore-QuotaWakeTestIsolation
-    throw
+    throw $quotaWakeTestFailure
 }
 $quotaWakeTestPaths = [ordered]@{
     Home          = Join-Path $script:QuotaWakeTestIsolationRoot "home"
