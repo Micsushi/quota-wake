@@ -120,6 +120,7 @@ $missedGroups = 0
 $lastMissedSlot = $null
 $lastMissedReason = $null
 $lastSuccessfulSlot = $null
+$agentHistory = [ordered]@{}
 $recordedCurrentScheduleKeys = New-Object `
     "Collections.Generic.HashSet[string]" `
     ([StringComparer]::Ordinal)
@@ -177,6 +178,28 @@ if (Test-Path -LiteralPath $historyPath -PathType Leaf) {
             )
             if (-not $isExecuted) {
                 continue
+            }
+            foreach ($entry in $record.results.PSObject.Properties) {
+                if (-not $agentHistory.Contains($entry.Name)) {
+                    $agentHistory[$entry.Name] = [pscustomobject]@{
+                        SuccessfulRuns = 0; FailedRuns = 0; LastSuccess = $null
+                        LastFailure = $null; FailureKinds = @{}
+                    }
+                }
+                $history = $agentHistory[$entry.Name]
+                if ($entry.Value.success) {
+                    $history.SuccessfulRuns++
+                    if (-not $history.LastSuccess -or [DateTimeOffset]$record.startedAt -gt [DateTimeOffset]$history.LastSuccess) {
+                        $history.LastSuccess = $record.startedAt
+                    }
+                } else {
+                    $history.FailedRuns++
+                    $kind = Get-QuotaWakeFailureKind -ErrorMessage ([string]$entry.Value.error)
+                    $history.FailureKinds[$kind] = 1 + [int]$history.FailureKinds[$kind]
+                    if (-not $history.LastFailure -or [DateTimeOffset]$record.startedAt -gt [DateTimeOffset]$history.LastFailure.At) {
+                        $history.LastFailure = [pscustomobject]@{ At = $record.startedAt; Kind = $kind }
+                    }
+                }
             }
             $recordSucceeded = [bool]$record.success
             if (
@@ -301,6 +324,7 @@ $status = [ordered]@{
     CodexUsage        = $codexUsage
     CodexActionCount  = $codexActionCount
     CodexAccounts     = [pscustomobject]$codexAccounts
+    AgentHistory      = [pscustomobject]$agentHistory
 }
 if ($task -and $taskOwned) {
     $taskInfo = Get-ScheduledTaskInfo `

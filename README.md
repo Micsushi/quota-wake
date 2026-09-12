@@ -18,7 +18,9 @@ A hidden Windows task that makes minimal Claude Code or Codex calls every five h
 
 `-Agents` is required. Setup verifies only the selected agents, remembers the
 selection, installs under `%LOCALAPPDATA%\QuotaWake`, and registers one hidden
-`QuotaWake` task. Defaults are Claude Haiku and GPT-5.4 mini.
+`QuotaWake` task. Defaults are Claude Haiku and GPT-5.6 Luna. Override the Codex
+model with `-CodexModel` when your account offers a different model. Setup
+verifies access; an API model listing alone does not establish ChatGPT access.
 
 ### Isolated Claude login
 
@@ -117,6 +119,7 @@ $status | Format-List
 $status.ClaudeUsage
 $status.CodexUsage
 $status.CodexAccounts
+$status.AgentHistory
 $status | Select-Object SuccessfulExecutedSlots,FailedExecutedSlots,MissedSlots,MissedGroups,PendingMissedSlots,LastMissedSlot,LastMissedReason,LastSuccessfulSlot,NextScheduledSlot
 ```
 
@@ -125,6 +128,12 @@ usage, model, timing, and zero-action proof are saved locally; raw CLI payloads
 are not. Each probe runs from an empty directory with tools and project/user
 instructions disabled for that call only. Claude's system prompt and Codex's
 base instructions are replaced with probe-only instructions.
+
+`AgentHistory` separates successes and failures for each account, including the
+last success and counts by failure kind. Old records without useful error details
+remain `unknown`. An unsupported model requires changing `-CodexModel`; a used
+or revoked refresh token requires signing in again in that account's configured
+`CODEX_HOME`. Do not copy another application's refresh token to repair it.
 
 `CodexUsage`, `CodexModel`, and `CodexActionCount` describe the first Codex
 account. `CodexAccounts` holds one entry per account, keyed by the configured

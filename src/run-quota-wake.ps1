@@ -374,6 +374,7 @@ if ($resultNames.Count -gt 0) {
         }
         $resultMap[$agent.ToLowerInvariant()] = $agentResult
         if (-not $agentResult.success) {
+            $agentResult | Add-Member -NotePropertyName failureKind -NotePropertyValue (Get-QuotaWakeFailureKind -ErrorMessage ([string]$agentResult.error)) -Force
             $success = $false
         }
     }

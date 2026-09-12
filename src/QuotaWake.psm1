@@ -412,6 +412,9 @@ function Get-AgentFailureGuidance {
         [string]$Problem
     )
 
+    if ($Agent.StartsWith('Codex') -and (Get-QuotaWakeFailureKind $Problem) -eq 'model_unavailable') {
+        return "$Agent is not ready: $Problem Select an available model with -CodexModel and rerun setup. Signing in again does not fix an unsupported model."
+    }
     if ($Agent -eq "Claude") {
         return (
             "Claude is not ready: $Problem " +
@@ -1096,6 +1099,27 @@ function Get-JsonLinesFailureDetail {
     return $detail
 }
 
+function Protect-QuotaWakeFailureDetail {
+    param([string]$Detail)
+    $text = ($Detail -replace "\s+", " ").Trim()
+    $text = $text -replace '(?i)\bbearer(?:\s*[:=]\s*|\s+)\S+|\b(access_token|refresh_token|token|api[_ -]?key)["'']?\s*[:=]\s*["'']?[^\s"'',}]+', '[redacted]'
+    $text = $text -replace '(?i)\bsk-[A-Za-z0-9_-]+', '[redacted]'
+    if ($text.Length -gt 240) { return $text.Substring(0, 240) + "..." }
+    return $text
+}
+
+function Get-QuotaWakeFailureKind {
+    param([string]$ErrorMessage)
+    switch -Regex ($ErrorMessage) {
+        '(?i)model.*(not supported|not found|does not exist|do not have access)' { return 'model_unavailable' }
+        '(?i)refresh token.*(already used|revoked)|access token.*refresh|OAuth.*expired|sign in again|unauthorized|authentication' { return 'login_required' }
+        '(?i)usage limit|spend limit|rate limit|quota (exceeded|exhausted)|429' { return 'usage_limit' }
+        '(?i)timed out|timeout' { return 'timeout' }
+        '(?i)failed to start|not found|cannot find' { return 'startup' }
+        default { return 'unknown' }
+    }
+}
+
 function Get-HiddenProcessFailureDetail {
     [CmdletBinding()]
     param(
@@ -1111,7 +1135,7 @@ function Get-HiddenProcessFailureDetail {
                 if ($property -and $property.Value -is [string]) {
                     $detail = ([string]$property.Value).Trim()
                     if ($detail) {
-                        return $detail
+                        return Protect-QuotaWakeFailureDetail $detail
                     }
                 }
             }
@@ -1125,7 +1149,7 @@ function Get-HiddenProcessFailureDetail {
         # notice - which was being reported as the failure for every run.
         $detail = Get-JsonLinesFailureDetail -Output $Output
         if ($detail) {
-            return $detail
+            return Protect-QuotaWakeFailureDetail $detail
         }
     }
 
@@ -1133,14 +1157,7 @@ function Get-HiddenProcessFailureDetail {
         return $null
     }
 
-    $detail = ($ErrorOutput -replace "\s+", " ").Trim()
-    $detail = $detail -replace `
-        "(?i)\b(bearer|token|api[_ -]?key)\s*[:=]\s*\S+", `
-        '$1=[redacted]'
-    if ($detail.Length -gt 240) {
-        return $detail.Substring(0, 240) + "..."
-    }
-    return $detail
+    return Protect-QuotaWakeFailureDetail $ErrorOutput
 }
 
 function Complete-HiddenProcess {
@@ -2172,6 +2189,7 @@ Export-ModuleMember -Function @(
     "Test-ClaudeAuthFailure",
     "Invoke-ClaudeReadOnlyProbe",
     "Get-JsonLinesFailureDetail",
+    "Get-QuotaWakeFailureKind",
     "Resolve-CodexCommandPath",
     "Get-DefaultInstallRoot",
     "Get-QuotaWakeOwnershipMarkerPath",

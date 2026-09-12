@@ -18,6 +18,15 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $modulePath = Join-Path $repoRoot "src\QuotaWake.psm1"
 Import-Module $modulePath -Force -DisableNameChecking
 
+Assert-Equal 'model_unavailable' (Get-QuotaWakeFailureKind "The 'gpt-5.4-mini' model is not supported when using Codex with a ChatGPT account.") 'unsupported model has a distinct cause'
+Assert-Equal 'login_required' (Get-QuotaWakeFailureKind 'Your refresh token was already used. Please sign in again.') 'revoked login needs authentication'
+Assert-Equal 'timeout' (Get-QuotaWakeFailureKind 'QuotaWake timed out.') 'utility name is not a quota exhaustion error'
+Assert-True ((Get-AgentFailureGuidance -Agent 'Codex:work' -Problem 'model is not supported') -match '-CodexModel') 'model failure explains the correct recovery'
+$safeDetail = & (Get-Module QuotaWake) { Get-HiddenProcessFailureDetail -Output '{"error":"request failed token=secret-value sk-private-key"}' }
+Assert-True ($safeDetail -notmatch 'secret-value|sk-private-key') 'structured failures redact credentials too'
+$safeDetail = & (Get-Module QuotaWake) { Get-HiddenProcessFailureDetail -ErrorOutput 'request failed Bearer private-token' }
+Assert-True ($safeDetail -notmatch 'private-token') 'stderr bearer credentials are redacted'
+
 Assert-Equal '"C:\Program Files\Quota Wake\worker.ps1"' `
     (Quote-CommandLineArgument 'C:\Program Files\Quota Wake\worker.ps1') `
     "paths with spaces are quoted"

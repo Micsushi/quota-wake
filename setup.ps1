@@ -35,7 +35,7 @@ param(
     [string]$ClaudeConfigDir,
 
     [ValidateNotNullOrEmpty()]
-    [string]$CodexModel = "gpt-5.4-mini",
+    [string]$CodexModel = "gpt-5.6-luna",
 
     # One "name=path" entry per Codex account, e.g.
     # -CodexHomes "work=C:\...\codex-work","personal=C:\...\codex-personal".
