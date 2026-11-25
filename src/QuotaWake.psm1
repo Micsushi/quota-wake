@@ -628,7 +628,8 @@ function Get-AgentProcessSpecifications {
                     "exec",
                     "--ephemeral",
                     "--skip-git-repo-check",
-                    "--ignore-user-config",
+                    "--ignore-user-config"
+                ) + @(if ($Config.codex.model -eq "gpt-6-luna") { "-c"; 'model_reasoning_effort="max"' }) + @(
                     "--ignore-rules",
                     "--disable",
                     "shell_tool",

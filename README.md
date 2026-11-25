@@ -18,7 +18,7 @@ A hidden Windows task that makes minimal Claude Code or Codex calls every five h
 
 `-Agents` is required. Setup verifies only the selected agents, remembers the
 selection, installs under `%LOCALAPPDATA%\QuotaWake`, and registers one hidden
-`QuotaWake` task. Defaults are Claude Haiku and GPT-5.6 Luna. Override the Codex
+`QuotaWake` task. Defaults are Claude Haiku and GPT-6 Luna. Override the Codex
 model with `-CodexModel` when your account offers a different model. Setup
 verifies access; an API model listing alone does not establish ChatGPT access.
 
