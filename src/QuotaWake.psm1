@@ -200,6 +200,9 @@ function Get-DefaultInstallRoot {
     $localApplicationData = [Environment]::GetFolderPath(
         [Environment+SpecialFolder]::LocalApplicationData
     )
+    if (-not $localApplicationData -and $env:LOCALAPPDATA) {
+        $localApplicationData = $env:LOCALAPPDATA
+    }
     if (-not $localApplicationData) {
         throw "Windows LocalApplicationData is unavailable."
     }
